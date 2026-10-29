@@ -1124,3 +1124,9 @@ def test_unicode_secretsmanager(sm):
     sm.create_secret(Name="unicode-secret", SecretString="пароль: 密码")
     resp = sm.get_secret_value(SecretId="unicode-secret")
     assert resp["SecretString"] == "пароль: 密码"
+
+
+def test_secretsmanager_describe_reports_primary_region_without_replicas(sm):
+    sm.create_secret(Name="sm-primary-region", SecretString="val")
+    resp = sm.describe_secret(SecretId="sm-primary-region")
+    assert resp["PrimaryRegion"] == resp["ARN"].split(":")[3]

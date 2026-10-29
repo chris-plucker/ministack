@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Secrets Manager — `DescribeSecret` reports `PrimaryRegion` for every secret** — it was returned only for a secret with replicas, so a client reading the Region a secret lives in got nothing for an ordinary secret; it is now the secret's own Region, and a replica still reports its source Region.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added

@@ -918,8 +918,8 @@ def _describe_secret(data):
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
-    if secret.get("_PrimaryRegion"):
-        result["PrimaryRegion"] = secret["_PrimaryRegion"]
+    # AWS reports the Region a secret lives in; replicas carry their source Region instead.
+    result["PrimaryRegion"] = secret.get("_PrimaryRegion") or secret["ARN"].split(":")[3]
     if secret.get("KmsKeyId"):
         result["KmsKeyId"] = secret["KmsKeyId"]
     if secret.get("RotationLambdaARN"):
