@@ -6157,7 +6157,8 @@ def _create_db_cluster_impl(p):
         "DBClusterMembers": [],
         "VpcSecurityGroups": vpc_sg_list,
         "DBSubnetGroup": _p(p, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _p(p, "DBClusterParameterGroupName") or f"default.{engine}",
+        "DBClusterParameterGroup": (_p(p, "DBClusterParameterGroupName")
+                                    or f"default.{_aurora_cluster_family(engine, engine_version) or engine}"),
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
         "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
@@ -6959,10 +6960,34 @@ def _create_db_cluster_param_group(p):
         </DBClusterParameterGroup></CreateDBClusterParameterGroupResult>""")
 
 
+def _aurora_cluster_family(engine, engine_version):
+    """The DB parameter group family AWS reports for an Aurora engine version, or None."""
+    catalog = {"aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
+               "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS}.get(engine, [])
+    return dict(catalog).get(engine_version)
+
+
+def _cluster_param_group(name):
+    """AWS provides a default cluster parameter group per Aurora engine family; synthesize those on lookup."""
+    pg = _db_cluster_param_groups.get(name)
+    if pg or not name or not name.startswith("default."):
+        return pg
+    family = name[len("default."):]
+    if family not in {f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}:
+        return None
+    return {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": family,
+        "Description": f"Default cluster parameter group for {family}",
+        "DBClusterParameterGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}",
+        "Parameters": {},
+    }
+
+
 def _describe_db_cluster_param_groups(p):
     name = _p(p, "DBClusterParameterGroupName")
     if name:
-        pg = _db_cluster_param_groups.get(name)
+        pg = _cluster_param_group(name)
         if not pg:
             return _error("DBParameterGroupNotFound",
                 f"DB cluster parameter group {name} not found.", 404)
@@ -6993,7 +7018,7 @@ def _delete_db_cluster_param_group(p):
 def _describe_db_cluster_parameters(p):
     name = _p(p, "DBClusterParameterGroupName")
     source_filter = _p(p, "Source")
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
