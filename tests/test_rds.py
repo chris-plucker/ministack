@@ -4730,6 +4730,19 @@ def test_rds_modify_cluster_password(rds):
     assert cluster["DBClusterIdentifier"] == "pw-mod-cluster"
 
 
+def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
+    """A waiter that polls until it has seen the reset, then until it settles, finishes."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-status",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-status", MasterUserPassword="new_pass")
+    statuses = [rds.describe_db_clusters(DBClusterIdentifier="pw-reset-status")["DBClusters"][0]["Status"]
+                for _ in range(2)]
+    assert statuses == ["resetting-master-credentials", "available"]
+
 def test_rds_modify_instance_password(rds):
     """ModifyDBInstance with MasterUserPassword updates the stored password."""
     rds.create_db_instance(

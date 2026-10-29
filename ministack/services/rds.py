@@ -6297,7 +6297,12 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
+    members = ""
+    for c in clusters:
+        if c.pop("_ResetPendingDescribe", False):
+            c = {**c, "Status": "resetting-master-credentials"}
+        members += f"<DBCluster>{_cluster_xml(c)}</DBCluster>"
+    members += docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -6505,6 +6510,8 @@ def _modify_db_cluster_impl(p):
                 400,
             )
         _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+        # Real RDS reports the reset before it settles; waiters look for it.
+        cluster["_ResetPendingDescribe"] = True
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
