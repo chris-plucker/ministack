@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — `DescribeInstanceTypes` reports Nitro and Graviton types as they are** — every type reported `Hypervisor` `xen` and `x86_64` only, so a client that requires Nitro (for example to allow an ElastiCache network type) rejected them all and a Graviton type looked like Intel; families built on the Nitro System now report `nitro`, the older Xen families (`t2`, `m4`, `c4`, `r4`, `i3` and their peers) `xen`, and Graviton families (`t4g`, `c7gn`, `r8gd`, `a1`, ...) `arm64`.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
