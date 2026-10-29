@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — managed prefix lists keep their creation tags, and tag filters exclude AWS-managed lists** — `CreateManagedPrefixList` dropped `TagSpecifications`, the form the SDKs send, so a list created with tags had none; and a `tag:<key>`, `tag-key` or `tag-value` filter on `DescribeManagedPrefixLists` still returned every AWS-managed list (`com.amazonaws.<region>.s3` and the others), so a lookup by tag that expects one match found several. Creation tags are now kept, and AWS-managed lists, which carry no tags, no longer match a tag filter.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
