@@ -1985,6 +1985,56 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     assert ("000000000000", "us-east-1", "rg-1") not in _ec._pending_rg_respawn
 
 
+def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkeypatch):
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: ("new-host", 6390, f"cid-{name}"))
+    old = {"Address": "old-host", "Port": 6379}
+    _ec.load_persisted_state({
+        "replication_groups": {
+            "rg-ep": {
+                "ReplicationGroupId": "rg-ep", "Engine": "redis", "EngineVersion": "7.1",
+                "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                                "NodeGroupMembers": [{"CacheClusterId": "rg-ep-0001-001", "ReadEndpoint": dict(old)}]}],
+                "_docker_container_ids": ["dead-cid"],
+            },
+        },
+    })
+    _ec._ensure_live_containers()
+    ng = _ec._replication_groups["rg-ep"]["NodeGroups"][0]
+    new = {"Address": "new-host", "Port": 6390}
+    assert ng["PrimaryEndpoint"] == ng["ReaderEndpoint"] == ng["NodeGroupMembers"][0]["ReadEndpoint"] == new
+
+
+def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
+    from ministack.services import elasticache as _ec
+    runs = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                runs.append(kwargs)
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    first = _ec._spawn_redis_container("ministack-elasticache-x", "valkey", "8.0", labels={})
+    second = _ec._spawn_redis_container("ministack-elasticache-x", "valkey", "8.0", labels={})
+    alias = runs[0]["networking_config"]["net"]["Aliases"][0]
+    assert first[0] == second[0] == alias != "172.18.0.9"
+    assert alias == _ec._endpoint_alias("ministack-elasticache-x")
+
 def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
     from ministack.services import elasticache as _ec

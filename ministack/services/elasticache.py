@@ -331,7 +331,7 @@ def _ensure_live_containers_locked():
             node_groups = rg.get("NodeGroups") or []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
-                _, _, cid = _spawn_redis_container(
+                host, port, cid = _spawn_redis_container(
                     name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
                     engine=engine, engine_version=engine_version,
                     transit=rg.get("TransitEncryptionEnabled", False), auth_token=_record_auth(rg),
@@ -343,6 +343,12 @@ def _ensure_live_containers_locked():
                 )
                 if cid:
                     rg["_docker_container_ids"].append(cid)
+                    # The node group's endpoints name the new container, as on creation.
+                    endpoint = {"Address": host, "Port": port}
+                    ng["PrimaryEndpoint"] = dict(endpoint)
+                    ng["ReaderEndpoint"] = dict(endpoint)
+                    for member in ng.get("NodeGroupMembers") or []:
+                        member["ReadEndpoint"] = dict(endpoint)
             log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(
@@ -550,10 +556,10 @@ def _node_cli_args(transit, auth_token):
     return args
 
 
-def _install_node_tls(container, name, container_ip):
+def _install_node_tls(container, name, container_ip, alias=None):
     from ministack.core.x509_utils import sign_leaf_certificate
 
-    candidates = ("localhost", _MINISTACK_HOST, name, "127.0.0.1", "::1", container_ip)
+    candidates = ("localhost", _MINISTACK_HOST, name, alias, "127.0.0.1", "::1", container_ip)
     dns_names = [n for n in dict.fromkeys(candidates) if n and not _is_ip(n)]
     ips = [n for n in dict.fromkeys(candidates) if n and _is_ip(n)]
     ca_pem, ca_key = _ensure_serverless_ca()
@@ -587,6 +593,11 @@ def _next_host_port():
         return port
 
 
+def _endpoint_alias(name):
+    """A short DNS-safe network alias for an engine container, stable across respawns."""
+    return "ec-" + hashlib.sha256(name.encode()).hexdigest()[:16]
+
+
 def _spawn_redis_container(name, engine, engine_version, labels, transit=False, auth_token=None):
     """Start a redis/valkey/memcached container.
 
@@ -617,6 +628,9 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             labels=labels,
             volumes={},
         )
+        # On a Docker network the endpoint is a name-derived alias, which a respawned
+        # container keeps; its address changes.
+        alias = _endpoint_alias(name)
         server_args = _node_server_args(container_port, tls, auth_token if redis_like else None)
         if server_args:
             run_kwargs["command"] = server_args
@@ -624,6 +638,7 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
+            run_kwargs["networking_config"] = {DOCKER_NETWORK: {"Aliases": [alias]}}
         container = docker_client.containers.run(**run_kwargs)
         container_ip = ""
         if DOCKER_NETWORK:
@@ -631,10 +646,10 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
         if tls:
-            _install_node_tls(container, name, container_ip)
+            _install_node_tls(container, name, container_ip, alias if DOCKER_NETWORK else None)
         if DOCKER_NETWORK:
             if container_ip:
-                endpoint_host = container_ip
+                endpoint_host = alias
                 endpoint_port = container_port
                 logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
                             engine, name, container_ip, container_port, DOCKER_NETWORK)

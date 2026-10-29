@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ElastiCache — endpoints stay valid after a restart** — engine endpoints on a Docker network were the container's IP address, and a replication group respawned after a restart kept the old one, so clients reading `DescribeReplicationGroups` connected to a dead address or to another container that had taken it; a replication group's endpoints now name the respawned container, and on a Docker network every engine endpoint is a network alias derived from the container name, which survives respawns and is named in the node's TLS certificate.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
