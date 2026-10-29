@@ -1234,6 +1234,25 @@ def test_rds_reset_db_parameters(rds):
     assert max_connections["ParameterValue"] == "151"
 
 
+def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
+    """Each Aurora engine family has a default cluster parameter group, which a new cluster uses."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="default-pg-cluster",
+        Engine="aurora-postgresql",
+        EngineVersion="16.8",
+        MasterUsername="admin",
+        MasterUserPassword="password1",
+    )
+    cluster = rds.describe_db_clusters(DBClusterIdentifier="default-pg-cluster")["DBClusters"][0]
+    assert cluster["DBClusterParameterGroup"] == "default.aurora-postgresql16"
+    group = rds.describe_db_cluster_parameter_groups(
+        DBClusterParameterGroupName="default.aurora-postgresql16")["DBClusterParameterGroups"][0]
+    assert group["DBParameterGroupFamily"] == "aurora-postgresql16"
+    assert rds.describe_db_cluster_parameters(DBClusterParameterGroupName="default.aurora-mysql8.0")
+    with pytest.raises(ClientError) as exc:
+        rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
+    assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
