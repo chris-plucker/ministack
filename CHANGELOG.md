@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **OpenSearch — `ChangeProgressDetails` names the domain's current change** — `CreateDomain` returned an empty `ChangeProgressDetails` and recorded no change, so a client tracking the creation by `ChangeId` through `DescribeDomainChangeProgress` had nothing to follow; creation now starts a change, and `CreateDomain`, `DescribeDomain` and `DescribeDomainChangeProgress` report the same `ChangeId`, which an `UpdateDomainConfig` replaces with its own.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
