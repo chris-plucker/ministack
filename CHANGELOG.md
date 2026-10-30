@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **Secrets Manager — `DescribeSecret` reports `PrimaryRegion` for every secret** — it was returned only for a secret with replicas, so a client reading the Region a secret lives in got nothing for an ordinary secret; it is now the secret's own Region, and a replica still reports its source Region.
+- **Secrets Manager — a replicated secret reports its own `PrimaryRegion`** — `DescribeSecret` and `ListSecrets` returned `PrimaryRegion` only for a replica, so a client reading the Region of a secret it replicated got nothing; the primary of a replicated secret now reports its own Region, as AWS does, a replica still reports its source Region, and a secret that is not replicated still has none.
 
 ## [1.5.35] — 2026-10-30
 

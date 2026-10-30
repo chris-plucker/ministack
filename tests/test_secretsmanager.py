@@ -1126,7 +1126,12 @@ def test_unicode_secretsmanager(sm):
     assert resp["SecretString"] == "пароль: 密码"
 
 
-def test_secretsmanager_describe_reports_primary_region_without_replicas(sm):
+def test_secretsmanager_primary_region_follows_replication(sm):
+    # As AWS answers: none for a secret without replicas, its own Region once it has some.
     sm.create_secret(Name="sm-primary-region", SecretString="val")
+    assert "PrimaryRegion" not in sm.describe_secret(SecretId="sm-primary-region")
+    sm.replicate_secret_to_regions(SecretId="sm-primary-region", AddReplicaRegions=[{"Region": "us-west-1"}])
     resp = sm.describe_secret(SecretId="sm-primary-region")
     assert resp["PrimaryRegion"] == resp["ARN"].split(":")[3]
+    listed = [s for s in sm.list_secrets()["SecretList"] if s["Name"] == "sm-primary-region"]
+    assert listed[0]["PrimaryRegion"] == resp["PrimaryRegion"]
