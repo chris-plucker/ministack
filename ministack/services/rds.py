@@ -6196,6 +6196,7 @@ def _create_db_cluster_impl(p):
         cluster["_PerformanceInsightsManaged"] = True
         cluster["DatabaseInsightsMode"] = "standard"
     _prepare_mysql_gtid_history(cluster)
+    _cluster_param_group(cluster["DBClusterParameterGroup"])  # a default group exists once a cluster uses it
     _clusters[cluster_id] = cluster
     if global_cluster:
         is_first_member = not global_cluster.get("GlobalClusterMembers")
@@ -6567,6 +6568,7 @@ def _modify_db_cluster_impl(p):
         cluster["CopyTagsToSnapshot"] = _p(p, "CopyTagsToSnapshot") == "true"
     if _p(p, "DBClusterParameterGroupName"):
         cluster["DBClusterParameterGroup"] = _p(p, "DBClusterParameterGroupName")
+        _cluster_param_group(cluster["DBClusterParameterGroup"])
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     if vpc_sgs:
@@ -6975,6 +6977,7 @@ def _set_cluster_engine_version(cluster, engine_version):
     new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
     if new_family and old_family and cluster.get("DBClusterParameterGroup") == f"default.{old_family}":
         cluster["DBClusterParameterGroup"] = f"default.{new_family}"
+        _cluster_param_group(cluster["DBClusterParameterGroup"])
     cluster["EngineVersion"] = engine_version
 
 
@@ -6990,14 +6993,15 @@ def _default_cluster_param_group(family):
 
 
 def _cluster_param_group(name):
-    """AWS provides a default cluster parameter group per Aurora engine family; synthesize those on lookup."""
+    """AWS has a default cluster parameter group per Aurora family; it joins the account once described or used."""
     pg = _db_cluster_param_groups.get(name)
     if pg or not name or not name.startswith("default."):
         return pg
     family = name[len("default."):]
     if family not in {f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}:
         return None
-    return _default_cluster_param_group(family)
+    pg = _db_cluster_param_groups[name] = _default_cluster_param_group(family)
+    return pg
 
 
 def _describe_db_cluster_param_groups(p):
@@ -7009,9 +7013,7 @@ def _describe_db_cluster_param_groups(p):
                 f"DB cluster parameter group {name} not found.", 404)
         groups = [pg]
     else:
-        # AWS lists every family's default group in every account.
-        families = sorted({f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS})
-        groups = [_default_cluster_param_group(f) for f in families] + list(_db_cluster_param_groups.values())
+        groups = list(_db_cluster_param_groups.values())
 
     members = "".join(f"""<DBClusterParameterGroup>
         <DBClusterParameterGroupName>{g['DBClusterParameterGroupName']}</DBClusterParameterGroupName>
