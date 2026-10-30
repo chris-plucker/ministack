@@ -1303,6 +1303,40 @@ def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(
     assert group("gl-member") == "default.aurora-postgresql17"
 
 
+def test_rds_default_cluster_parameter_groups_are_immutable(rds):
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-mysql8.0")
+    for call in (
+        lambda: rds.delete_db_cluster_parameter_group(DBClusterParameterGroupName="default.aurora-mysql8.0"),
+        lambda: rds.modify_db_cluster_parameter_group(
+            DBClusterParameterGroupName="default.aurora-mysql8.0",
+            Parameters=[{"ParameterName": "max_connections", "ParameterValue": "10", "ApplyMethod": "immediate"}]),
+        lambda: rds.reset_db_cluster_parameter_group(
+            DBClusterParameterGroupName="default.aurora-mysql8.0", ResetAllParameters=True),
+    ):
+        with pytest.raises(ClientError) as exc:
+            call()
+        assert exc.value.response["Error"]["Code"] == "InvalidDBParameterGroupState"
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-mysql8.0")
+
+
+def test_rds_global_upgrade_materializes_default_group_in_each_members_region():
+    def client(region):
+        return boto3.client("rds", endpoint_url=ENDPOINT, aws_access_key_id="434343434343",
+                            aws_secret_access_key="test", region_name=region)
+
+    east, west = client("us-east-1"), client("us-west-2")
+    east.create_global_cluster(GlobalClusterIdentifier="gl-xr", Engine="aurora-postgresql", EngineVersion="16.8")
+    west.create_db_cluster(DBClusterIdentifier="xr-member", Engine="aurora-postgresql", EngineVersion="16.8",
+                           MasterUsername="admin", MasterUserPassword="password1",
+                           GlobalClusterIdentifier="gl-xr")
+    east.modify_global_cluster(GlobalClusterIdentifier="gl-xr", EngineVersion="17", AllowMajorVersionUpgrade=True)
+    cluster = west.describe_db_clusters(DBClusterIdentifier="xr-member")["DBClusters"][0]
+    assert cluster["DBClusterParameterGroup"] == "default.aurora-postgresql17"
+    names = {g["DBClusterParameterGroupName"]
+             for g in west.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
+    assert "default.aurora-postgresql17" in names
+
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
