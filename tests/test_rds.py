@@ -1333,6 +1333,9 @@ def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
     assert steps(resp) == ("available", *old, {"EngineVersion": "16.8"})
     first = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
     assert steps(first) == ("upgrading", *old, {"EngineVersion": "16.8"})
+    with pytest.raises(ClientError) as exc:
+        rds.stop_db_cluster(DBClusterIdentifier="seq-up")
+    assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
     last = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
     assert steps(last) == ("available", "16.8", "default.aurora-postgresql16", None)
     assert steps(rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]) == steps(last)
@@ -1342,6 +1345,18 @@ def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
     assert groups["seq-up-1"] == {"DBParameterGroupName": "default.aurora-postgresql16",
                                   "ParameterApplyStatus": "in-sync"}
     assert groups["seq-up-custom"]["DBParameterGroupName"] == "seq-up-pg"
+    assert {i["EngineVersion"] for i in rds.describe_db_instances()["DBInstances"]
+            if i["DBInstanceIdentifier"].startswith("seq-up-")} == {"16.8"}
+
+
+def test_rds_major_upgrade_of_a_cluster_without_a_stored_parameter_group():
+    """Clusters made by CloudFormation carry no DBClusterParameterGroup; an upgrade must not fail."""
+    from ministack.services import rds as rds_service
+
+    cluster = {"Engine": "aurora-postgresql", "EngineVersion": "15.13", "DBClusterIdentifier": "no-pg-field"}
+    rds_service._set_cluster_engine_version(cluster, "16.8")
+    assert cluster["EngineVersion"] == "16.8"
+    assert "DBClusterParameterGroup" not in cluster
 
 
 def test_rds_default_cluster_parameter_groups_are_immutable(rds):

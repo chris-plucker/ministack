@@ -147,7 +147,11 @@ def _upgrade_clear(arn=None):
 
 
 def _upgrade_view(c, advance):
-    """Return *c* as AWS shows it while a major upgrade is in progress."""
+    """Return *c* as AWS shows it while a major upgrade is in progress.
+
+    The first describe moves the stored cluster to status upgrading, so the
+    state checks of other operations see it; the next one settles it.
+    """
     arn = c.get("DBClusterArn")
     with _upgrade_pending_lock:
         entry = _upgrade_pending.get(arn)
@@ -156,14 +160,17 @@ def _upgrade_view(c, advance):
         if advance:
             if entry["seen"] >= 1:
                 _upgrade_pending.pop(arn, None)
+                if c.get("Status") == "upgrading":
+                    c["Status"] = "available"
                 return c
             entry["seen"] += 1
-        seen = entry["seen"]
+            if c.get("Status") == "available":
+                c["Status"] = "upgrading"
         old_version, old_group = entry["EngineVersion"], entry["DBClusterParameterGroup"]
-    view = {**c, "EngineVersion": old_version, "DBClusterParameterGroup": old_group,
+    view = {**c, "EngineVersion": old_version,
             "PendingModifiedValues": {"EngineVersion": c["EngineVersion"]}}
-    if seen and c.get("Status") == "available":
-        view["Status"] = "upgrading"
+    if old_group:
+        view["DBClusterParameterGroup"] = old_group
     return view
 
 
@@ -434,6 +441,8 @@ def _restore_state(data, *, resume_runtime=False):
         # normally survive, but the flag must not outlive a volume that
         # did not.
         cluster.pop("_pg_replication_source_ready", None)
+        if cluster.get("Status") == "upgrading":
+            cluster["Status"] = "available"  # the in-flight upgrade does not survive a restart
         if cluster.get("_mysql_replication_source_arn"):
             # A respawned MySQL container gets a new hostname, while the
             # persisted replica repository and relay-log names belong to the
@@ -7025,7 +7034,7 @@ def _set_cluster_engine_version(cluster, engine_version):
     old_family = _aurora_cluster_family(engine, old_version)
     new_family = _aurora_cluster_family(engine, engine_version)
     major = bool(new_family and old_family and new_family != old_family)
-    if major and old_group == f"default.{old_family}":
+    if major and old_group and old_group == f"default.{old_family}":
         cluster["DBClusterParameterGroup"] = f"default.{new_family}"
     cluster["EngineVersion"] = engine_version
     if not major:
@@ -7033,12 +7042,14 @@ def _set_cluster_engine_version(cluster, engine_version):
     # A global member may live in another Region or account than this request.
     arn = _parse_rds_arn(cluster.get("DBClusterArn", ""))
     with request_scope(arn[0].account_id, arn[0].region) if arn else contextlib.nullcontext():
-        _cluster_param_group(cluster["DBClusterParameterGroup"])
+        _cluster_param_group(cluster.get("DBClusterParameterGroup"))
         old_instance_defaults = {f"default.{old_family}", f"default.{engine}{(old_version or '').split('.')[0]}"}
         for instance in _instances.values():
+            if instance.get("DBClusterIdentifier") != cluster.get("DBClusterIdentifier"):
+                continue
+            instance["EngineVersion"] = engine_version
             groups = instance.get("DBParameterGroups") or []
-            if (instance.get("DBClusterIdentifier") == cluster.get("DBClusterIdentifier")
-                    and groups and groups[0].get("DBParameterGroupName") in old_instance_defaults):
+            if groups and groups[0].get("DBParameterGroupName") in old_instance_defaults:
                 groups[0]["DBParameterGroupName"] = f"default.{new_family}"
     if cluster.get("DBClusterArn"):
         with _upgrade_pending_lock:
