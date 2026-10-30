@@ -2011,8 +2011,6 @@ def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkey
 
 def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
     from ministack.services import elasticache as _ec
-    from ministack.services import rds as _rds
-    monkeypatch.setattr(_rds, "_in_container", lambda: True)
     runs = []
 
     class _Container:
@@ -2651,24 +2649,46 @@ def test_elasticache_spawns_real_container_on_docker_bridge(monkeypatch):
             _ec._teardown_containers(client, [cid])
 
 
-def test_elasticache_host_run_ministack_keeps_the_container_address(monkeypatch):
+@pytest.mark.data_plane
+def test_elasticache_public_endpoint_is_reachable_from_the_host(monkeypatch):
+    """MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT: a client outside the Docker network, which cannot
+    resolve the alias, reaches the engine through the published port."""
+    docker = pytest.importorskip("docker")
+    import socket
     from ministack.services import elasticache as _ec
-    from ministack.services import rds as _rds
-
-    class _Container:
-        id = "cid"
-        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
-
-        def reload(self):
-            pass
-
-    class _Client:
-        class containers:
-            @staticmethod
-            def run(**kwargs):
-                return _Container()
-
-    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
-    monkeypatch.setattr(_rds, "_in_container", lambda: False)
-    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
-    assert _ec._spawn_redis_container("ministack-elasticache-h", "valkey", "8.0", labels={})[0] == "172.18.0.9"
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception:
+        pytest.skip("no Docker daemon")
+    net = client.networks.create(f"ec-pub-{_uuid_mod.uuid4().hex[:8]}")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        free_port = sock.getsockname()[1]
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", net.name)
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", True)
+    try:  # the daemon host as seen from here: Docker Desktop's name when pytest is in a container
+        daemon_host = socket.gethostbyname("host.docker.internal")
+    except OSError:
+        daemon_host = "127.0.0.1"
+    monkeypatch.setattr(_ec, "_MINISTACK_HOST", daemon_host)
+    monkeypatch.setattr(_ec, "_next_host_port", lambda: free_port)
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    host, port, cid = _ec._spawn_redis_container(
+        f"ministack-elasticache-pub-{_uuid_mod.uuid4().hex[:8]}", "valkey", "8.0", labels={"ministack": "test"})
+    try:
+        assert cid and (host, port) == (daemon_host, free_port)
+        deadline = time.time() + 30
+        while True:
+            try:
+                with socket.create_connection((host, port), timeout=2) as conn:
+                    conn.sendall(b"PING\r\n")
+                    assert conn.recv(16).startswith(b"+PONG")
+                    break
+            except OSError:
+                assert time.time() < deadline
+                time.sleep(0.5)
+    finally:
+        if cid:
+            _ec._teardown_containers(client, [cid])
+        net.remove()

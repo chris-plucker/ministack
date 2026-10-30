@@ -60,6 +60,10 @@ REDIS_DEFAULT_HOST = os.environ.get("REDIS_HOST", "redis")
 REDIS_DEFAULT_PORT = int(os.environ.get("REDIS_PORT", "6379"))
 BASE_PORT = int(os.environ.get("ELASTICACHE_BASE_PORT", "16379"))
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
+# Same switch as RDS: report {MINISTACK_HOST, published port} instead of the container-network
+# endpoint, for clients outside the Docker network (host-side clients, CI runners).
+ELASTICACHE_PUBLIC_ENDPOINT = os.environ.get(
+    "MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT", "0").lower() in ("1", "true", "yes")
 
 # Opt-in: when NumNodeGroups>1 and this is set, spawn a real redis cluster
 # (cluster-enabled containers + redis-cli --cluster create bootstrap) instead
@@ -652,11 +656,10 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             _install_node_tls(container, name, container_ip, alias)
         if DOCKER_NETWORK:
             if container_ip:
-                # Docker's DNS resolves the alias only for clients on the network, so a
-                # host-run MiniStack (whose clients are on the host) keeps the address.
-                from ministack.services.rds import _in_container
-                endpoint_host = alias if alias and _in_container() else container_ip
-                endpoint_port = container_port
+                # The alias, or under MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT the published port.
+                if not ELASTICACHE_PUBLIC_ENDPOINT:
+                    endpoint_host = alias or container_ip
+                    endpoint_port = container_port
                 logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
                             engine, name, container_ip, container_port, DOCKER_NETWORK)
             else:
