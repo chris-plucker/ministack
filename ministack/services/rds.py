@@ -6299,7 +6299,9 @@ def _describe_db_clusters(p):
 
     members = ""
     for c in clusters:
-        if c.pop("_ResetPendingDescribe", False) and c.get("Status") == "available":
+        with _shared_container_lock:  # get_state() deep-copies under this lock
+            reset_pending = c.pop("_ResetPendingDescribe", False)
+        if reset_pending and c.get("Status") == "available":
             c = {**c, "Status": "resetting-master-credentials"}
         members += f"<DBCluster>{_cluster_xml(c)}</DBCluster>"
     members += docdb_members
@@ -6513,7 +6515,8 @@ def _modify_db_cluster_impl(p):
         # Real RDS reports the reset before it settles; waiters look for it.
         # A stopped/stopping/starting cluster keeps reporting its lifecycle state.
         if cluster.get("Status") == "available":
-            cluster["_ResetPendingDescribe"] = True
+            with _shared_container_lock:
+                cluster["_ResetPendingDescribe"] = True
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
@@ -7389,7 +7392,8 @@ def _start_db_cluster(p):
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
-    cluster.pop("_ResetPendingDescribe", None)
+    with _shared_container_lock:
+        cluster.pop("_ResetPendingDescribe", None)
     cluster["Status"] = "starting"
     for inst in member_instances:
         inst["DBInstanceStatus"] = "starting"
@@ -7606,7 +7610,8 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
-    cluster.pop("_ResetPendingDescribe", None)
+    with _shared_container_lock:
+        cluster.pop("_ResetPendingDescribe", None)
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
