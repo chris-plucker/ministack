@@ -6542,12 +6542,7 @@ def _modify_db_cluster_impl(p):
             )
         _apply_cluster_master_password_change(cluster, new_pass)
     if engine_version:
-        # A cluster on the default group moves to the target version's default; a custom group stays.
-        old_default = f"default.{_aurora_cluster_family(cluster.get('Engine'), cluster.get('EngineVersion')) or ''}"
-        new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
-        if new_family and cluster.get("DBClusterParameterGroup") == old_default:
-            cluster["DBClusterParameterGroup"] = f"default.{new_family}"
-        cluster["EngineVersion"] = engine_version
+        _set_cluster_engine_version(cluster, engine_version)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -6969,7 +6964,18 @@ def _aurora_cluster_family(engine, engine_version):
     """The DB parameter group family AWS reports for an Aurora engine version, or None."""
     catalog = {"aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
                "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS}.get(engine, [])
-    return dict(catalog).get(engine_version)
+    # A dot-boundary prefix ("17", "8.0") resolves to the family of the versions it prefixes.
+    return next((fam for ver, fam in catalog
+                 if engine_version and (ver == engine_version or ver.startswith(engine_version + "."))), None)
+
+
+def _set_cluster_engine_version(cluster, engine_version):
+    """Set a cluster's engine version; a cluster on the default group moves to the new version's default."""
+    old_family = _aurora_cluster_family(cluster.get("Engine"), cluster.get("EngineVersion"))
+    new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+    if new_family and old_family and cluster.get("DBClusterParameterGroup") == f"default.{old_family}":
+        cluster["DBClusterParameterGroup"] = f"default.{new_family}"
+    cluster["EngineVersion"] = engine_version
 
 
 def _default_cluster_param_group(family):
@@ -8385,7 +8391,7 @@ def _modify_global_cluster_impl(p):
         for member in gc.get("GlobalClusterMembers", []):
             member_cluster = _resolve_cluster(member["DBClusterArn"])
             if member_cluster:
-                member_cluster["EngineVersion"] = engine_version
+                _set_cluster_engine_version(member_cluster, engine_version)
 
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")

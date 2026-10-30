@@ -1270,6 +1270,26 @@ def test_rds_default_cluster_parameter_groups_listed_and_follow_major_upgrade(rd
     assert got == {"up-default": "default.aurora-mysql8.0", "up-custom": "keep-me"}
 
 
+def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(rds):
+    def make(cid, **kw):
+        rds.create_db_cluster(DBClusterIdentifier=cid, Engine="aurora-postgresql", EngineVersion="16.8",
+                              MasterUsername="admin", MasterUserPassword="password1", **kw)
+
+    def group(cid):
+        return rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterParameterGroup"]
+
+    make("pfx-up")
+    rds.modify_db_cluster(DBClusterIdentifier="pfx-up", EngineVersion="17",
+                          AllowMajorVersionUpgrade=True, ApplyImmediately=True)
+    assert group("pfx-up") == "default.aurora-postgresql17"
+
+    rds.create_global_cluster(GlobalClusterIdentifier="gl-up", Engine="aurora-postgresql", EngineVersion="16.8")
+    make("gl-member", GlobalClusterIdentifier="gl-up")
+    rds.modify_global_cluster(GlobalClusterIdentifier="gl-up", EngineVersion="17",
+                              AllowMajorVersionUpgrade=True)
+    assert group("gl-member") == "default.aurora-postgresql17"
+
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
