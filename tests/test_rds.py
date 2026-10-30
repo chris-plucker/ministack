@@ -4758,6 +4758,13 @@ def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
     )
     def status():
         return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
+    rds.get_waiter("db_instance_available").wait(
+        DBInstanceIdentifier="pw-reset-stop-1", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
+    for _ in range(120):
+        if status() == "available":
+            break
+        time.sleep(0.5)
+    assert status() == "available"
     rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="new_pass")
     rds.stop_db_cluster(DBClusterIdentifier="pw-reset-stop")
     assert status() != "resetting-master-credentials"
