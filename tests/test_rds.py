@@ -4743,6 +4743,34 @@ def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
                 for _ in range(2)]
     assert statuses == ["resetting-master-credentials", "available"]
 
+
+def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
+    """A stopped cluster reports stopped, whether it was stopped after or before the reset."""
+    rds.create_db_cluster(
+        DBClusterIdentifier="pw-reset-stop",
+        Engine="aurora-postgresql",
+        MasterUsername="admin",
+        MasterUserPassword="old_pass",
+    )
+    rds.create_db_instance(
+        DBInstanceIdentifier="pw-reset-stop-1", DBInstanceClass="db.r5.large",
+        Engine="aurora-postgresql", DBClusterIdentifier="pw-reset-stop",
+    )
+    def status():
+        return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="new_pass")
+    rds.stop_db_cluster(DBClusterIdentifier="pw-reset-stop")
+    assert status() != "resetting-master-credentials"
+    for _ in range(60):
+        if status() == "stopped":
+            break
+        time.sleep(0.5)
+    assert status() == "stopped"
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="newer_pass")
+    assert status() == "stopped"
+    assert status() == "stopped"
+
+
 def test_rds_modify_instance_password(rds):
     """ModifyDBInstance with MasterUserPassword updates the stored password."""
     rds.create_db_instance(
