@@ -6273,6 +6273,7 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
+        _reset_pending.discard(cluster.get("DBClusterArn"))
         master_user_secret = cluster.get("MasterUserSecret")
         if master_user_secret and master_user_secret.get("SecretArn"):
             # RDS deletes its managed master user secret with the cluster.
@@ -6302,8 +6303,11 @@ def _describe_db_clusters(p):
 
     members = ""
     for c in clusters:
-        reset_pending = c.get("DBClusterArn") in _reset_pending
-        _reset_pending.discard(c.get("DBClusterArn"))
+        try:
+            _reset_pending.remove(c.get("DBClusterArn"))  # atomic consume
+            reset_pending = True
+        except KeyError:
+            reset_pending = False
         if reset_pending and c.get("Status") == "available":
             c = {**c, "Status": "resetting-master-credentials"}
         members += f"<DBCluster>{_cluster_xml(c)}</DBCluster>"
@@ -11613,6 +11617,7 @@ def reset():
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
     with _shared_container_lock:
+        _reset_pending.clear()
         _mysql_global_writer_switch_owners.clear()
         _mysql_global_instance_mutations.clear()
         docker_client = _get_docker()

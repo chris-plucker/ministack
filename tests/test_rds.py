@@ -4744,6 +4744,16 @@ def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
     assert statuses == ["resetting-master-credentials", "available"]
 
 
+def test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster(rds):
+    kw = dict(DBClusterIdentifier="pw-reset-recreate", Engine="aurora-postgresql",
+              MasterUsername="admin", MasterUserPassword="old_pass")
+    rds.create_db_cluster(**kw)
+    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-recreate", MasterUserPassword="new_pass")
+    rds.delete_db_cluster(DBClusterIdentifier="pw-reset-recreate", SkipFinalSnapshot=True)
+    rds.create_db_cluster(**kw)
+    assert rds.describe_db_clusters(DBClusterIdentifier="pw-reset-recreate")["DBClusters"][0]["Status"] == "available"
+
+
 def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
     """A stopped cluster reports stopped, whether it was stopped after or before the reset."""
     rds.create_db_cluster(
@@ -4752,14 +4762,8 @@ def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
         MasterUsername="admin",
         MasterUserPassword="old_pass",
     )
-    rds.create_db_instance(
-        DBInstanceIdentifier="pw-reset-stop-1", DBInstanceClass="db.r5.large",
-        Engine="aurora-postgresql", DBClusterIdentifier="pw-reset-stop",
-    )
     def status():
         return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
-    rds.get_waiter("db_instance_available").wait(
-        DBInstanceIdentifier="pw-reset-stop-1", WaiterConfig={"Delay": 1, "MaxAttempts": 120})
     for _ in range(120):
         if status() == "available":
             break

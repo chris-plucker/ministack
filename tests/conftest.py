@@ -253,6 +253,7 @@ def routed_request(key, service, method, path, body=b"", headers=None, host="loc
 
 
 _SERIAL_TESTS = {
+    "tests/test_rds.py::test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster",
     "tests/test_rds.py::test_rds_cluster_password_reset_is_visible_before_it_settles",
     "tests/test_rds.py::test_rds_cluster_password_reset_does_not_mask_stopped_cluster",
     "tests/test_athena.py::test_athena_queries_glue_backed_parquet",
