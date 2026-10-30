@@ -1253,6 +1253,15 @@ def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
         rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
     assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
 
+def _settled_cluster(client, cid):
+    """Describe a cluster until its major upgrade has finished (it takes two describes)."""
+    for _ in range(3):
+        cluster = client.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]
+        if "PendingModifiedValues" not in cluster:
+            return cluster
+    raise AssertionError("upgrade never settled")
+
+
 def test_rds_default_cluster_parameter_groups_listed_once_materialized_and_follow_major_upgrade():
     """Real AWS (us-west-2): a default group is listed only once described by name or used by a cluster."""
     rds = boto3.client("rds", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
@@ -1277,8 +1286,7 @@ def test_rds_default_cluster_parameter_groups_listed_once_materialized_and_follo
                               **({"DBClusterParameterGroupName": "keep-me"} if cid == "up-custom" else {}))
         rds.modify_db_cluster(DBClusterIdentifier=cid, EngineVersion="8.0.mysql_aurora.3.10.3",
                               AllowMajorVersionUpgrade=True, ApplyImmediately=True)
-    got = {c["DBClusterIdentifier"]: c["DBClusterParameterGroup"]
-           for c in rds.describe_db_clusters()["DBClusters"] if c["DBClusterIdentifier"].startswith("up-")}
+    got = {cid: _settled_cluster(rds, cid)["DBClusterParameterGroup"] for cid in ("up-default", "up-custom")}
     assert got == {"up-default": "default.aurora-mysql8.0", "up-custom": "keep-me"}
     assert "default.aurora-mysql8.0" in listed()
 
@@ -1289,7 +1297,7 @@ def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(
                               MasterUsername="admin", MasterUserPassword="password1", **kw)
 
     def group(cid):
-        return rds.describe_db_clusters(DBClusterIdentifier=cid)["DBClusters"][0]["DBClusterParameterGroup"]
+        return _settled_cluster(rds, cid)["DBClusterParameterGroup"]
 
     make("pfx-up")
     rds.modify_db_cluster(DBClusterIdentifier="pfx-up", EngineVersion="17",
@@ -1301,6 +1309,39 @@ def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(
     rds.modify_global_cluster(GlobalClusterIdentifier="gl-up", EngineVersion="17",
                               AllowMajorVersionUpgrade=True)
     assert group("gl-member") == "default.aurora-postgresql17"
+
+
+def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
+    """Real AWS (us-west-2, Aurora PostgreSQL 15.19 -> 16.15): available+pending, upgrading+pending, then done."""
+    rds.create_db_cluster(DBClusterIdentifier="seq-up", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    rds.create_db_instance(DBInstanceIdentifier="seq-up-1", DBInstanceClass="db.r6g.large",
+                           Engine="aurora-postgresql", DBClusterIdentifier="seq-up")
+    rds.create_db_instance(DBInstanceIdentifier="seq-up-custom", DBInstanceClass="db.r6g.large",
+                           Engine="aurora-postgresql", DBClusterIdentifier="seq-up")
+    rds.create_db_parameter_group(DBParameterGroupName="seq-up-pg", DBParameterGroupFamily="aurora-postgresql15",
+                                  Description="x")
+    rds.modify_db_instance(DBInstanceIdentifier="seq-up-custom", DBParameterGroupName="seq-up-pg",
+                           ApplyImmediately=True)
+
+    def steps(c):
+        return (c["Status"], c["EngineVersion"], c["DBClusterParameterGroup"], c.get("PendingModifiedValues"))
+
+    resp = rds.modify_db_cluster(DBClusterIdentifier="seq-up", EngineVersion="16.8",
+                                 AllowMajorVersionUpgrade=True, ApplyImmediately=True)["DBCluster"]
+    old = ("15.13", "default.aurora-postgresql15")
+    assert steps(resp) == ("available", *old, {"EngineVersion": "16.8"})
+    first = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
+    assert steps(first) == ("upgrading", *old, {"EngineVersion": "16.8"})
+    last = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
+    assert steps(last) == ("available", "16.8", "default.aurora-postgresql16", None)
+    assert steps(rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]) == steps(last)
+
+    groups = {i["DBInstanceIdentifier"]: i["DBParameterGroups"][0]
+              for i in rds.describe_db_instances()["DBInstances"] if i["DBInstanceIdentifier"].startswith("seq-up-")}
+    assert groups["seq-up-1"] == {"DBParameterGroupName": "default.aurora-postgresql16",
+                                  "ParameterApplyStatus": "in-sync"}
+    assert groups["seq-up-custom"]["DBParameterGroupName"] == "seq-up-pg"
 
 
 def test_rds_default_cluster_parameter_groups_are_immutable(rds):
@@ -1330,7 +1371,7 @@ def test_rds_global_upgrade_materializes_default_group_in_each_members_region():
                            MasterUsername="admin", MasterUserPassword="password1",
                            GlobalClusterIdentifier="gl-xr")
     east.modify_global_cluster(GlobalClusterIdentifier="gl-xr", EngineVersion="17", AllowMajorVersionUpgrade=True)
-    cluster = west.describe_db_clusters(DBClusterIdentifier="xr-member")["DBClusters"][0]
+    cluster = _settled_cluster(west, "xr-member")
     assert cluster["DBClusterParameterGroup"] == "default.aurora-postgresql17"
     names = {g["DBClusterParameterGroupName"]
              for g in west.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
