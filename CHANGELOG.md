@@ -8,7 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
-- **RDS — default Aurora cluster parameter groups** — `DescribeDBClusterParameterGroups` and `DescribeDBClusterParameters` answered `DBParameterGroupNotFound` for a default group such as `default.aurora-postgresql16`, and a new cluster reported `default.aurora-postgresql` with no version; each Aurora family in the engine-version catalog now has its `default.<family>` group, and a cluster created without a parameter group reports its engine version's default, as AWS names it.
+- **RDS — default Aurora cluster parameter groups** — `DescribeDBClusterParameterGroups` and `DescribeDBClusterParameters` answered `DBParameterGroupNotFound` for a default group such as `default.aurora-postgresql16`, and a new cluster reported `default.aurora-postgresql` with no version; each Aurora family in the engine-version catalog now has its `default.<family>` group, and a cluster created without a parameter group reports its engine version's default, as AWS names it; an unfiltered `DescribeDBClusterParameterGroups` lists every family's default group, and a major engine upgrade moves a cluster on the default group to the target version's default while keeping a custom group.
 
 ## [1.5.35] — 2026-10-30
 
