@@ -106,7 +106,7 @@ jobs:
 
       - name: Start MiniStack
         run: |
-          REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
+          MINISTACK_HOST=$(hostname -I | awk '{print $1}') REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
           for i in $(seq 1 15); do
             curl -sf http://localhost:4566/_ministack/health && break
             echo "Waiting for MiniStack... ($i/15)"
@@ -231,7 +231,8 @@ jobs:
       DSQL_STRICT: "1"
       MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
       # MiniStack and pytest run on the runner, outside the Docker network, so they reach
-      # engines through published ports, not network aliases.
+      # ElastiCache engines through published ports, not network aliases; MINISTACK_HOST is
+      # set below to the runner's address, which Lambda containers reach as well.
       MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT: "1"
     steps:
       - uses: actions/checkout@v6
