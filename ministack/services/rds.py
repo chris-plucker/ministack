@@ -136,6 +136,14 @@ _reset_pending = {}
 _reset_pending_lock = threading.Lock()
 
 
+def _reset_clear(arn=None):
+    with _reset_pending_lock:
+        if arn is None:
+            _reset_pending.clear()
+        else:
+            _reset_pending.pop(arn, None)
+
+
 def _reset_view(c, advance):
     """Return *c* as AWS shows it during a master password reset."""
     arn = c.get("DBClusterArn")
@@ -145,7 +153,7 @@ def _reset_view(c, advance):
             return c
         if advance:
             if seen >= 2:
-                del _reset_pending[arn]
+                _reset_pending.pop(arn, None)
             else:
                 _reset_pending[arn] = seen + 1
     if advance and seen >= 2:
@@ -6298,7 +6306,7 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
-        _reset_pending.pop(cluster.get("DBClusterArn"), None)
+        _reset_clear(cluster.get("DBClusterArn"))
         master_user_secret = cluster.get("MasterUserSecret")
         if master_user_secret and master_user_secret.get("SecretArn"):
             # RDS deletes its managed master user secret with the cluster.
@@ -7422,7 +7430,7 @@ def _start_db_cluster(p):
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
-    _reset_pending.pop(cluster.get("DBClusterArn"), None)
+    _reset_clear(cluster.get("DBClusterArn"))
     cluster["Status"] = "starting"
     for inst in member_instances:
         inst["DBInstanceStatus"] = "starting"
@@ -7639,7 +7647,7 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
-    _reset_pending.pop(cluster.get("DBClusterArn"), None)
+    _reset_clear(cluster.get("DBClusterArn"))
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
@@ -11649,7 +11657,7 @@ def reset():
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
     with _shared_container_lock:
-        _reset_pending.clear()
+        _reset_clear()
         _mysql_global_writer_switch_owners.clear()
         _mysql_global_instance_mutations.clear()
         docker_client = _get_docker()
