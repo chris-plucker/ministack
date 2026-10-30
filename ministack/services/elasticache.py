@@ -652,7 +652,10 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             _install_node_tls(container, name, container_ip, alias)
         if DOCKER_NETWORK:
             if container_ip:
-                endpoint_host = alias or container_ip
+                # Docker's DNS resolves the alias only for clients on the network, so a
+                # host-run MiniStack (whose clients are on the host) keeps the address.
+                from ministack.services.rds import _in_container
+                endpoint_host = alias if alias and _in_container() else container_ip
                 endpoint_port = container_port
                 logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
                             engine, name, container_ip, container_port, DOCKER_NETWORK)

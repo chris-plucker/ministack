@@ -2011,6 +2011,8 @@ def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkey
 
 def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
     from ministack.services import elasticache as _ec
+    from ministack.services import rds as _rds
+    monkeypatch.setattr(_rds, "_in_container", lambda: True)
     runs = []
 
     class _Container:
@@ -2622,6 +2624,7 @@ def test_elasticache_builtin_network_keeps_ip_endpoint_without_alias(monkeypatch
     assert (host, cid) == ("172.17.0.9", "cid")
 
 
+@pytest.mark.data_plane
 def test_elasticache_spawns_real_container_on_docker_bridge(monkeypatch):
     docker = pytest.importorskip("docker")
     from ministack.services import elasticache as _ec
@@ -2646,3 +2649,26 @@ def test_elasticache_spawns_real_container_on_docker_bridge(monkeypatch):
     finally:
         if cid:
             _ec._teardown_containers(client, [cid])
+
+
+def test_elasticache_host_run_ministack_keeps_the_container_address(monkeypatch):
+    from ministack.services import elasticache as _ec
+    from ministack.services import rds as _rds
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_rds, "_in_container", lambda: False)
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    assert _ec._spawn_redis_container("ministack-elasticache-h", "valkey", "8.0", labels={})[0] == "172.18.0.9"
