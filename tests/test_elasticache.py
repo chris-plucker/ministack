@@ -2011,6 +2011,7 @@ def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkey
 
 def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
     from ministack.services import elasticache as _ec
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
     runs = []
 
     class _Container:
@@ -2599,6 +2600,7 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
 
 def test_elasticache_builtin_network_keeps_ip_endpoint_without_alias(monkeypatch):
     from ministack.services import elasticache as _ec
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
     runs = []
 
     class _Container:
@@ -2692,3 +2694,32 @@ def test_elasticache_public_endpoint_is_reachable_from_the_host(monkeypatch):
         if cid:
             _ec._teardown_containers(client, [cid])
         net.remove()
+
+
+def test_elasticache_serverless_public_endpoint_announces_the_published_port(monkeypatch):
+    from ministack.services import elasticache as _ec
+    puts = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+        def put_archive(self, path, data):
+            puts.append(data)
+            return True
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(_ec, "_MINISTACK_HOST", "ms.example")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    address, port, _ = _ec._spawn_serverless_container("sls", "valkey", "8.0", 16999, labels={}, wait=False)
+    assert (address, port) == ("ms.example", 16999)

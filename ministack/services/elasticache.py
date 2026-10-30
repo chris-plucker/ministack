@@ -2423,7 +2423,7 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
             container.reload()
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
-            if container_ip:
+            if container_ip and not ELASTICACHE_PUBLIC_ENDPOINT:
                 address, port = container_ip, container_port
         candidates = ("localhost", _MINISTACK_HOST, name, "127.0.0.1", "::1", container_ip)
         dns_names = [n for n in dict.fromkeys(candidates) if n and not _is_ip(n)]

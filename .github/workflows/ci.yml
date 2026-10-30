@@ -230,6 +230,9 @@ jobs:
       OPENSEARCH_DATAPLANE: "1"
       DSQL_STRICT: "1"
       MINISTACK_RDS_PG_CLUSTER_REPLICATION: "1"
+      # MiniStack and pytest run on the runner, outside the Docker network, so they reach
+      # engines through published ports, not network aliases.
+      MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT: "1"
     steps:
       - uses: actions/checkout@v6
 
