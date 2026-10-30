@@ -6542,6 +6542,11 @@ def _modify_db_cluster_impl(p):
             )
         _apply_cluster_master_password_change(cluster, new_pass)
     if engine_version:
+        # A cluster on the default group moves to the target version's default; a custom group stays.
+        old_default = f"default.{_aurora_cluster_family(cluster.get('Engine'), cluster.get('EngineVersion')) or ''}"
+        new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+        if new_family and cluster.get("DBClusterParameterGroup") == old_default:
+            cluster["DBClusterParameterGroup"] = f"default.{new_family}"
         cluster["EngineVersion"] = engine_version
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
@@ -6967,6 +6972,17 @@ def _aurora_cluster_family(engine, engine_version):
     return dict(catalog).get(engine_version)
 
 
+def _default_cluster_param_group(family):
+    name = f"default.{family}"
+    return {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": family,
+        "Description": f"Default cluster parameter group for {family}",
+        "DBClusterParameterGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}",
+        "Parameters": {},
+    }
+
+
 def _cluster_param_group(name):
     """AWS provides a default cluster parameter group per Aurora engine family; synthesize those on lookup."""
     pg = _db_cluster_param_groups.get(name)
@@ -6975,13 +6991,7 @@ def _cluster_param_group(name):
     family = name[len("default."):]
     if family not in {f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}:
         return None
-    return {
-        "DBClusterParameterGroupName": name,
-        "DBParameterGroupFamily": family,
-        "Description": f"Default cluster parameter group for {family}",
-        "DBClusterParameterGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}",
-        "Parameters": {},
-    }
+    return _default_cluster_param_group(family)
 
 
 def _describe_db_cluster_param_groups(p):
@@ -6993,7 +7003,9 @@ def _describe_db_cluster_param_groups(p):
                 f"DB cluster parameter group {name} not found.", 404)
         groups = [pg]
     else:
-        groups = list(_db_cluster_param_groups.values())
+        # AWS lists every family's default group in every account.
+        families = sorted({f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS})
+        groups = [_default_cluster_param_group(f) for f in families] + list(_db_cluster_param_groups.values())
 
     members = "".join(f"""<DBClusterParameterGroup>
         <DBClusterParameterGroupName>{g['DBClusterParameterGroupName']}</DBClusterParameterGroupName>

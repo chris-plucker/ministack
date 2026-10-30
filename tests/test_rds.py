@@ -1253,6 +1253,23 @@ def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
         rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
     assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
 
+def test_rds_default_cluster_parameter_groups_listed_and_follow_major_upgrade(rds):
+    names = {g["DBClusterParameterGroupName"]
+             for g in rds.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
+    assert {"default.aurora-mysql5.7", "default.aurora-mysql8.0"} <= names
+    rds.create_db_cluster_parameter_group(
+        DBClusterParameterGroupName="keep-me", DBParameterGroupFamily="aurora-mysql8.0", Description="x")
+    for cid in ("up-default", "up-custom"):
+        rds.create_db_cluster(DBClusterIdentifier=cid, Engine="aurora-mysql", EngineVersion="5.7.mysql_aurora.2.12.6",
+                              MasterUsername="admin", MasterUserPassword="password1",
+                              **({"DBClusterParameterGroupName": "keep-me"} if cid == "up-custom" else {}))
+        rds.modify_db_cluster(DBClusterIdentifier=cid, EngineVersion="8.0.mysql_aurora.3.10.3",
+                              AllowMajorVersionUpgrade=True, ApplyImmediately=True)
+    got = {c["DBClusterIdentifier"]: c["DBClusterParameterGroup"]
+           for c in rds.describe_db_clusters()["DBClusters"] if c["DBClusterIdentifier"].startswith("up-")}
+    assert got == {"up-default": "default.aurora-mysql8.0", "up-custom": "keep-me"}
+
+
 def test_rds_modify_and_describe_cluster_parameters(rds):
     """ModifyDBClusterParameterGroup stores ApplyMethod; DescribeDBClusterParameters returns it."""
     rds.create_db_cluster_parameter_group(
