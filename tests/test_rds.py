@@ -1333,6 +1333,8 @@ def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
     assert steps(resp) == ("available", *old, {"EngineVersion": "16.8"})
     first = rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]
     assert steps(first) == ("upgrading", *old, {"EngineVersion": "16.8"})
+    rds.create_db_instance(DBInstanceIdentifier="seq-other", DBInstanceClass="db.t3.micro", Engine="postgres")
+    rds.delete_db_instance(DBInstanceIdentifier="seq-other", SkipFinalSnapshot=True)  # refreshes every cluster
     with pytest.raises(ClientError) as exc:
         rds.stop_db_cluster(DBClusterIdentifier="seq-up")
     assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
@@ -1357,6 +1359,20 @@ def test_rds_major_upgrade_of_a_cluster_without_a_stored_parameter_group():
     rds_service._set_cluster_engine_version(cluster, "16.8")
     assert cluster["EngineVersion"] == "16.8"
     assert "DBClusterParameterGroup" not in cluster
+
+
+def test_rds_pending_upgrade_does_not_leak_to_a_recreated_cluster_and_survives_status_refresh():
+    from ministack.services import rds as rds_service
+
+    arn = "arn:aws:rds:us-east-1:000000000000:cluster:leak"
+    old = {"DBClusterArn": arn, "Engine": "aurora-postgresql", "EngineVersion": "15.13", "Status": "available",
+           "DBClusterIdentifier": "leak"}
+    rds_service._set_cluster_engine_version(old, "16.8")
+    assert rds_service._upgrade_view(old, True)["Status"] == "upgrading"
+    assert old["Status"] == "upgrading"
+    new = {"DBClusterArn": arn, "Engine": "aurora-postgresql", "EngineVersion": "17.7", "Status": "available"}
+    assert rds_service._upgrade_view(new, True) is new
+    rds_service._upgrade_clear(arn)
 
 
 def test_rds_default_cluster_parameter_groups_are_immutable(rds):
