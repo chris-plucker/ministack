@@ -635,8 +635,11 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
         # On a user-defined Docker network the endpoint is a name-derived alias, which a
         # respawned container keeps; its address changes. Docker refuses aliases on
         # built-in networks (bridge/host/none), which keep the address endpoint.
-        from ministack.services.rds import _network_supports_aliases
-        alias = _endpoint_alias(name) if _network_supports_aliases(DOCKER_NETWORK) else None
+        # A host-run MiniStack's clients are on the host, which cannot resolve the alias,
+        # so it keeps the address, as before.
+        from ministack.services.rds import _in_container, _network_supports_aliases
+        alias = (_endpoint_alias(name)
+                 if _network_supports_aliases(DOCKER_NETWORK) and _in_container() else None)
         server_args = _node_server_args(container_port, tls, auth_token if redis_like else None)
         if server_args:
             run_kwargs["command"] = server_args

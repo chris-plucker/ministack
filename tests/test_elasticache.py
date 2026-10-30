@@ -2012,6 +2012,8 @@ def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkey
 def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
     from ministack.services import elasticache as _ec
     monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
+    from ministack.services import rds as _rds
+    monkeypatch.setattr(_rds, "_in_container", lambda: True)
     runs = []
 
     class _Container:
@@ -2723,3 +2725,30 @@ def test_elasticache_serverless_public_endpoint_announces_the_published_port(mon
     monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
     address, port, _ = _ec._spawn_serverless_container("sls", "valkey", "8.0", 16999, labels={}, wait=False)
     assert (address, port) == ("ms.example", 16999)
+
+
+def test_elasticache_host_run_ministack_keeps_the_container_address(monkeypatch):
+    """A host-run MiniStack's clients (and Lambda containers) reached the container IP before
+    aliases; they still do."""
+    from ministack.services import elasticache as _ec
+    from ministack.services import rds as _rds
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                assert "networking_config" not in kwargs
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
+    monkeypatch.setattr(_rds, "_in_container", lambda: False)
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    assert _ec._spawn_redis_container("ministack-elasticache-h", "valkey", "8.0", labels={})[0] == "172.18.0.9"
