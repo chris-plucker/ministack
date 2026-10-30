@@ -628,9 +628,11 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             labels=labels,
             volumes={},
         )
-        # On a Docker network the endpoint is a name-derived alias, which a respawned
-        # container keeps; its address changes.
-        alias = _endpoint_alias(name)
+        # On a user-defined Docker network the endpoint is a name-derived alias, which a
+        # respawned container keeps; its address changes. Docker refuses aliases on
+        # built-in networks (bridge/host/none), which keep the address endpoint.
+        from ministack.services.rds import _network_supports_aliases
+        alias = _endpoint_alias(name) if _network_supports_aliases(DOCKER_NETWORK) else None
         server_args = _node_server_args(container_port, tls, auth_token if redis_like else None)
         if server_args:
             run_kwargs["command"] = server_args
@@ -638,7 +640,8 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             run_kwargs["entrypoint"] = ["sh", "-c", _NODE_TLS_WRAPPER, "ministack-elasticache-tls"]
         if DOCKER_NETWORK:
             run_kwargs["network"] = DOCKER_NETWORK
-            run_kwargs["networking_config"] = {DOCKER_NETWORK: {"Aliases": [alias]}}
+            if alias:
+                run_kwargs["networking_config"] = {DOCKER_NETWORK: {"Aliases": [alias]}}
         container = docker_client.containers.run(**run_kwargs)
         container_ip = ""
         if DOCKER_NETWORK:
@@ -646,10 +649,10 @@ def _spawn_redis_container(name, engine, engine_version, labels, transit=False, 
             networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
             container_ip = networks.get(DOCKER_NETWORK, {}).get("IPAddress", "")
         if tls:
-            _install_node_tls(container, name, container_ip, alias if DOCKER_NETWORK else None)
+            _install_node_tls(container, name, container_ip, alias)
         if DOCKER_NETWORK:
             if container_ip:
-                endpoint_host = alias
+                endpoint_host = alias or container_ip
                 endpoint_port = container_port
                 logger.info("ElastiCache: started %s container %s at %s:%s (network %s)",
                             engine, name, container_ip, container_port, DOCKER_NETWORK)

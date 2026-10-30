@@ -2595,3 +2595,54 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_builtin_network_keeps_ip_endpoint_without_alias(monkeypatch):
+    from ministack.services import elasticache as _ec
+    runs = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                runs.append(kwargs)
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "bridge")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    host, _, cid = _ec._spawn_redis_container("ministack-elasticache-b", "valkey", "8.0", labels={})
+    assert "networking_config" not in runs[0]
+    assert (host, cid) == ("172.17.0.9", "cid")
+
+
+def test_elasticache_spawns_real_container_on_docker_bridge(monkeypatch):
+    docker = pytest.importorskip("docker")
+    from ministack.services import elasticache as _ec
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception:
+        pytest.skip("no Docker daemon")
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "bridge")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    import socket
+    with socket.socket() as sock:  # a free host port; sibling test runs share the daemon
+        sock.bind(("", 0))
+        free_port = sock.getsockname()[1]
+    monkeypatch.setattr(_ec, "_next_host_port", lambda: free_port)
+    name = f"ministack-elasticache-bridge-{_uuid_mod.uuid4().hex[:8]}"
+    host, _, cid = _ec._spawn_redis_container(name, "valkey", "8.0", labels={"ministack": "test"})
+    try:
+        # A fallback to the shared Redis returns no container id.
+        assert cid
+        assert host != _ec._endpoint_alias(name)
+    finally:
+        if cid:
+            _ec._teardown_containers(client, [cid])
