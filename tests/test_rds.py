@@ -1253,10 +1253,22 @@ def test_rds_default_cluster_parameter_groups_exist_for_aurora_families(rds):
         rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.not-a-family")
     assert exc.value.response["Error"]["Code"] == "DBParameterGroupNotFound"
 
-def test_rds_default_cluster_parameter_groups_listed_and_follow_major_upgrade(rds):
-    names = {g["DBClusterParameterGroupName"]
-             for g in rds.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
-    assert {"default.aurora-mysql5.7", "default.aurora-mysql8.0"} <= names
+def test_rds_default_cluster_parameter_groups_listed_once_materialized_and_follow_major_upgrade():
+    """Real AWS (us-west-2): a default group is listed only once described by name or used by a cluster."""
+    rds = boto3.client("rds", endpoint_url=os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566"),
+                       aws_access_key_id="424242424242", aws_secret_access_key="test", region_name="us-west-2")
+    def listed():
+        return {g["DBClusterParameterGroupName"]
+                for g in rds.describe_db_cluster_parameter_groups()["DBClusterParameterGroups"]}
+
+    assert not any(n.startswith("default.") for n in listed())
+    rds.describe_db_cluster_parameter_groups(DBClusterParameterGroupName="default.aurora-postgresql16")
+    assert {n for n in listed() if n.startswith("default.")} == {"default.aurora-postgresql16"}
+    rds.create_db_cluster(DBClusterIdentifier="mat-pg15", Engine="aurora-postgresql", EngineVersion="15.13",
+                          MasterUsername="admin", MasterUserPassword="password1")
+    assert {n for n in listed() if n.startswith("default.")} == {
+        "default.aurora-postgresql15", "default.aurora-postgresql16"}
+
     rds.create_db_cluster_parameter_group(
         DBClusterParameterGroupName="keep-me", DBParameterGroupFamily="aurora-mysql8.0", Description="x")
     for cid in ("up-default", "up-custom"):
@@ -1268,6 +1280,7 @@ def test_rds_default_cluster_parameter_groups_listed_and_follow_major_upgrade(rd
     got = {c["DBClusterIdentifier"]: c["DBClusterParameterGroup"]
            for c in rds.describe_db_clusters()["DBClusters"] if c["DBClusterIdentifier"].startswith("up-")}
     assert got == {"up-default": "default.aurora-mysql8.0", "up-custom": "keep-me"}
+    assert "default.aurora-mysql8.0" in listed()
 
 
 def test_rds_default_cluster_parameter_group_follows_prefix_and_global_upgrades(rds):
