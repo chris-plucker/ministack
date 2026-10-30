@@ -4731,17 +4731,23 @@ def test_rds_modify_cluster_password(rds):
 
 
 def test_rds_cluster_password_reset_is_visible_before_it_settles(rds):
-    """A waiter that polls until it has seen the reset, then until it settles, finishes."""
+    """Real AWS (us-west-2): pending ****, then resetting-master-credentials, then available."""
     rds.create_db_cluster(
         DBClusterIdentifier="pw-reset-status",
         Engine="aurora-postgresql",
         MasterUsername="admin",
         MasterUserPassword="old_pass",
     )
-    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-status", MasterUserPassword="new_pass")
-    statuses = [rds.describe_db_clusters(DBClusterIdentifier="pw-reset-status")["DBClusters"][0]["Status"]
-                for _ in range(2)]
-    assert statuses == ["resetting-master-credentials", "available"]
+    modified = rds.modify_db_cluster(
+        DBClusterIdentifier="pw-reset-status", MasterUserPassword="new_pass")["DBCluster"]
+    assert modified["Status"] == "available"
+    assert modified["PendingModifiedValues"] == {"MasterUserPassword": "****"}
+    seen = [(c["Status"], c.get("PendingModifiedValues", {}))
+            for c in (rds.describe_db_clusters(DBClusterIdentifier="pw-reset-status")["DBClusters"][0]
+                      for _ in range(4))]
+    pending = {"MasterUserPassword": "****"}
+    assert seen == [("available", pending), ("resetting-master-credentials", pending),
+                    ("available", {}), ("available", {})]
 
 
 def test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster(rds):
@@ -4754,8 +4760,8 @@ def test_rds_cluster_password_reset_does_not_leak_to_a_recreated_cluster(rds):
     assert rds.describe_db_clusters(DBClusterIdentifier="pw-reset-recreate")["DBClusters"][0]["Status"] == "available"
 
 
-def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
-    """A stopped cluster reports stopped, whether it was stopped after or before the reset."""
+def test_rds_cluster_password_reset_on_stopped_cluster_is_rejected(rds):
+    """Real AWS: a stopped cluster refuses a password change; a stop clears a pending reset."""
     rds.create_db_cluster(
         DBClusterIdentifier="pw-reset-stop",
         Engine="aurora-postgresql",
@@ -4764,11 +4770,6 @@ def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
     )
     def status():
         return rds.describe_db_clusters(DBClusterIdentifier="pw-reset-stop")["DBClusters"][0]["Status"]
-    for _ in range(120):
-        if status() == "available":
-            break
-        time.sleep(0.5)
-    assert status() == "available"
     rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="new_pass")
     rds.stop_db_cluster(DBClusterIdentifier="pw-reset-stop")
     assert status() != "resetting-master-credentials"
@@ -4777,8 +4778,10 @@ def test_rds_cluster_password_reset_does_not_mask_stopped_cluster(rds):
             break
         time.sleep(0.5)
     assert status() == "stopped"
-    rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="newer_pass")
-    assert status() == "stopped"
+    with pytest.raises(ClientError) as exc:
+        rds.modify_db_cluster(DBClusterIdentifier="pw-reset-stop", MasterUserPassword="newer_pass")
+    assert exc.value.response["Error"]["Code"] == "InvalidDBClusterStateFault"
+    assert exc.value.response["Error"]["Message"] == "Db cluster pw-reset-stop cannot be in the stopped state."
     assert status() == "stopped"
 
 
