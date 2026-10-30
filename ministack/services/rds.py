@@ -70,6 +70,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
@@ -6977,7 +6978,13 @@ def _set_cluster_engine_version(cluster, engine_version):
     new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
     if new_family and old_family and cluster.get("DBClusterParameterGroup") == f"default.{old_family}":
         cluster["DBClusterParameterGroup"] = f"default.{new_family}"
-        _cluster_param_group(cluster["DBClusterParameterGroup"])
+        # A global member may live in another Region or account than this request.
+        arn = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+        if arn:
+            with request_scope(arn[0].account_id, arn[0].region):
+                _cluster_param_group(cluster["DBClusterParameterGroup"])
+        else:
+            _cluster_param_group(cluster["DBClusterParameterGroup"])
     cluster["EngineVersion"] = engine_version
 
 
@@ -6995,13 +7002,21 @@ def _default_cluster_param_group(family):
 def _cluster_param_group(name):
     """AWS has a default cluster parameter group per Aurora family; it joins the account once described or used."""
     pg = _db_cluster_param_groups.get(name)
-    if pg or not name or not name.startswith("default."):
+    if pg or not _is_default_cluster_param_group(name):
         return pg
-    family = name[len("default."):]
-    if family not in {f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}:
-        return None
-    pg = _db_cluster_param_groups[name] = _default_cluster_param_group(family)
+    pg = _db_cluster_param_groups[name] = _default_cluster_param_group(name[len("default."):])
     return pg
+
+
+def _is_default_cluster_param_group(name):
+    return bool(name) and name.startswith("default.") and name[len("default."):] in {
+        f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}
+
+
+def _default_cluster_param_group_immutable(name, verb):
+    if _is_default_cluster_param_group(name):
+        return _error("InvalidDBParameterGroupState",
+            f"You cannot {verb} the default DB cluster parameter group {name}.", 400)
 
 
 def _describe_db_cluster_param_groups(p):
@@ -7027,6 +7042,8 @@ def _describe_db_cluster_param_groups(p):
 
 def _delete_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if immutable := _default_cluster_param_group_immutable(name, "delete"):
+        return immutable
     pg = _db_cluster_param_groups.pop(name, None)
     if not pg:
         return _error("DBParameterGroupNotFound",
@@ -7049,6 +7066,8 @@ def _describe_db_cluster_parameters(p):
 
 def _modify_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if immutable := _default_cluster_param_group_immutable(name, "modify"):
+        return immutable
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
@@ -7070,6 +7089,8 @@ def _modify_db_cluster_param_group(p):
 
 def _reset_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if immutable := _default_cluster_param_group_immutable(name, "reset"):
+        return immutable
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
