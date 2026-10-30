@@ -106,7 +106,7 @@ jobs:
 
       - name: Start MiniStack
         run: |
-          MINISTACK_HOST=$(hostname -I | awk '{print $1}') REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
+          REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
           for i in $(seq 1 15); do
             curl -sf http://localhost:4566/_ministack/health && break
             echo "Waiting for MiniStack... ($i/15)"
@@ -272,7 +272,7 @@ jobs:
 
       - name: Start MiniStack
         run: |
-          REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
+          MINISTACK_HOST=$(hostname -I | awk '{print $1}') REDIS_HOST=localhost python -m ministack > ministack.log 2>&1 &
           echo "MINISTACK_PID=$!" >> "$GITHUB_ENV"
           for i in $(seq 1 15); do
             curl -sf http://localhost:4566/_ministack/health && break
