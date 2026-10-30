@@ -157,6 +157,10 @@ def _upgrade_view(c, advance):
         entry = _upgrade_pending.get(arn)
         if entry is None:
             return c
+        if entry["cluster"] is not c:
+            # A cluster re-created under the same ARN (CloudFormation deletes without our cleanup).
+            _upgrade_pending.pop(arn, None)
+            return c
         if advance:
             if entry["seen"] >= 1:
                 _upgrade_pending.pop(arn, None)
@@ -4078,7 +4082,7 @@ def _refresh_cluster_status(cluster_id):
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return
-    if cluster.get("Status") in ("stopping", "stopped", "deleting"):
+    if cluster.get("Status") in ("stopping", "stopped", "deleting", "upgrading"):
         return
     member_ids = {
         m.get("DBInstanceIdentifier")
@@ -7054,7 +7058,7 @@ def _set_cluster_engine_version(cluster, engine_version):
     if cluster.get("DBClusterArn"):
         with _upgrade_pending_lock:
             _upgrade_pending[cluster["DBClusterArn"]] = {
-                "seen": 0, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
+                "seen": 0, "cluster": cluster, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
 
 
 def _default_cluster_param_group(family):
