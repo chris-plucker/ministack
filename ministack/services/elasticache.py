@@ -2463,7 +2463,8 @@ def _user_group_acl_commands(account_id, region, group_ids, deny=()):
         return []
     user_ids = dict.fromkeys(uid for gid in group_ids
                              for uid in (_user_groups.get_scoped(account_id, region, gid) or {}).get("UserIds", []))
-    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids) if u]
+    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids)
+             if u and u.get("UserName") != "_ministack-admin"]
     default = next((u for u in users if u.get("UserName") == "default"), None)
     commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
     commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset"])
@@ -2471,7 +2472,7 @@ def _user_group_acl_commands(account_id, region, group_ids, deny=()):
 
 
 # The internal user MiniStack administers a replication group's engines as, since `default` may be off.
-# AWS rejects this name for a user (it must begin with a letter), so no application user can take it.
+# A group user of that name is never applied, so none can take it over.
 _ACL_ADMIN = "_ministack-admin"
 # Restricted commands an application user could take over users or the server's auth with
 # (AWS docs, "Restricted commands"). Redis below 7 cannot deny a subcommand alone.
