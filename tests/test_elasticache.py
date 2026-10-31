@@ -2584,7 +2584,7 @@ def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path
     off without a default user, application users cannot change users, and detaching restores default."""
     uid, pw = _uid(), "a-long-enough-password-1"
     app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
-    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all (~* +@all)", Passwords=[pw])
     ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
     ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
                                 CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])

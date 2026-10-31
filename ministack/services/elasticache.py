@@ -469,6 +469,7 @@ _DOCKER_BACKED_ACTIONS = {
     "ModifyReplicationGroup", "IncreaseReplicaCount", "DecreaseReplicaCount",
     "DescribeCacheClusters", "DescribeReplicationGroups",
     "CreateServerlessCache", "DeleteServerlessCache", "ModifyServerlessCache",
+    "ModifyUser", "DeleteUser", "ModifyUserGroup", "DeleteUserGroup",  # configure attached engines
 }
 
 
@@ -2439,7 +2440,10 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
 def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
-    rules = ["reset", *user.get("AccessString", "").split(), *deny]
+    rules = ["reset"]
+    for token in user.get("AccessString", "").split():  # each (selector) grants on its own: deny there too
+        rules += [token[:-1], *deny[:-1], deny[-1] + ")"] if deny and token.endswith(")") else [token]
+    rules += deny
     if user.get("Authentication", {}).get("Type") == "password" and user.get("_PasswordHashes"):
         rules += [f"#{h}" for h in user["_PasswordHashes"]]
     else:
