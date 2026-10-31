@@ -128,56 +128,6 @@ _port_counter = [BASE_PORT]
 _docker = None
 _ministack_network = None
 _shared_container_lock = threading.RLock()
-# Cluster ARN -> a major upgrade AWS has accepted but not finished. Real AWS
-# (captured, us-west-2, Aurora PostgreSQL 15.19 -> 16.15): ModifyDBCluster answers
-# status available, the old version and group, and PendingModifiedValues
-# {EngineVersion: new}; the next describe shows status upgrading with the pending
-# value; the one after shows the new version and default group, nothing pending.
-# Kept beside the cluster dicts, as the stored cluster already holds the end state.
-_upgrade_pending = {}
-_upgrade_pending_lock = threading.Lock()
-
-
-def _upgrade_clear(arn=None):
-    with _upgrade_pending_lock:
-        if arn is None:
-            _upgrade_pending.clear()
-        else:
-            _upgrade_pending.pop(arn, None)
-
-
-def _upgrade_view(c, advance):
-    """Return *c* as AWS shows it while a major upgrade is in progress.
-
-    The first describe moves the stored cluster to status upgrading, so the
-    state checks of other operations see it; the next one settles it.
-    """
-    arn = c.get("DBClusterArn")
-    with _upgrade_pending_lock:
-        entry = _upgrade_pending.get(arn)
-        if entry is None:
-            return c
-        if entry["cluster"] is not c:
-            # A cluster re-created under the same ARN (CloudFormation deletes without our cleanup).
-            _upgrade_pending.pop(arn, None)
-            return c
-        if advance:
-            if entry["seen"] >= 1:
-                _upgrade_pending.pop(arn, None)
-                if c.get("Status") == "upgrading":
-                    c["Status"] = "available"
-                return c
-            entry["seen"] += 1
-            if c.get("Status") == "available":
-                c["Status"] = "upgrading"
-        old_version, old_group = entry["EngineVersion"], entry["DBClusterParameterGroup"]
-    view = {**c, "EngineVersion": old_version,
-            "PendingModifiedValues": {"EngineVersion": c["EngineVersion"]}}
-    if old_group:
-        view["DBClusterParameterGroup"] = old_group
-    return view
-
-
 _mysql_global_writer_switch_lock = threading.RLock()
 _mysql_global_writer_switch_owners = {}
 _mysql_global_instance_mutations = {}
@@ -445,8 +395,6 @@ def _restore_state(data, *, resume_runtime=False):
         # normally survive, but the flag must not outlive a volume that
         # did not.
         cluster.pop("_pg_replication_source_ready", None)
-        if cluster.get("Status") == "upgrading":
-            cluster["Status"] = "available"  # the in-flight upgrade does not survive a restart
         if cluster.get("_mysql_replication_source_arn"):
             # A respawned MySQL container gets a new hostname, while the
             # persisted replica repository and relay-log names belong to the
@@ -6326,7 +6274,6 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
-        _upgrade_clear(cluster.get("DBClusterArn"))
         master_user_secret = cluster.get("MasterUserSecret")
         if master_user_secret and master_user_secret.get("SecretArn"):
             # RDS deletes its managed master user secret with the cluster.
@@ -7017,6 +6964,35 @@ def _create_db_cluster_param_group(p):
         </DBClusterParameterGroup></CreateDBClusterParameterGroupResult>""")
 
 
+def _upgrade_view(c, advance):
+    """Return *c* as AWS shows it while a major upgrade is in progress.
+
+    Real AWS (captured, us-west-2, Aurora PostgreSQL 15.19 -> 16.15): ModifyDBCluster
+    answers status available, the old version and group, and PendingModifiedValues
+    {EngineVersion: new}; the next describe shows status upgrading (stored, so the
+    state checks of other operations see it); the one after shows the new version
+    and default group, nothing pending. The stored cluster already holds the end state.
+    """
+    pending = c.get("_major_upgrade_pending")
+    if pending is None:
+        return c
+    if advance:
+        if pending["seen"]:
+            c.pop("_major_upgrade_pending", None)  # concurrent describes may both settle it
+            if c.get("Status") == "upgrading":
+                c["Status"] = "available"
+                _refresh_cluster_status(c.get("DBClusterIdentifier"))  # members restarting after a restore
+            return c
+        pending["seen"] = 1
+        if c.get("Status") == "available":
+            c["Status"] = "upgrading"
+    view = {**c, "EngineVersion": pending["EngineVersion"],
+            "PendingModifiedValues": {"EngineVersion": c["EngineVersion"]}}
+    if pending["DBClusterParameterGroup"]:
+        view["DBClusterParameterGroup"] = pending["DBClusterParameterGroup"]
+    return view
+
+
 def _aurora_cluster_family(engine, engine_version):
     """The DB parameter group family AWS reports for an Aurora engine version, or None."""
     catalog = {"aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
@@ -7055,10 +7031,8 @@ def _set_cluster_engine_version(cluster, engine_version):
             groups = instance.get("DBParameterGroups") or []
             if groups and groups[0].get("DBParameterGroupName") in old_instance_defaults:
                 groups[0]["DBParameterGroupName"] = f"default.{new_family}"
-    if cluster.get("DBClusterArn"):
-        with _upgrade_pending_lock:
-            _upgrade_pending[cluster["DBClusterArn"]] = {
-                "seen": 0, "cluster": cluster, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
+    cluster["_major_upgrade_pending"] = {
+        "seen": 0, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
 
 
 def _default_cluster_param_group(family):
@@ -11744,7 +11718,6 @@ def reset():
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
     with _shared_container_lock:
-        _upgrade_clear()
         _mysql_global_writer_switch_owners.clear()
         _mysql_global_instance_mutations.clear()
         docker_client = _get_docker()

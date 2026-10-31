@@ -1377,7 +1377,9 @@ def test_rds_pending_upgrade_does_not_leak_to_a_recreated_cluster_and_survives_s
     assert old["Status"] == "upgrading"
     new = {"DBClusterArn": arn, "Engine": "aurora-postgresql", "EngineVersion": "17.7", "Status": "available"}
     assert rds_service._upgrade_view(new, True) is new
-    rds_service._upgrade_clear(arn)
+    restored = json.loads(json.dumps(old))  # as persisted and loaded
+    assert rds_service._upgrade_view(restored, True)["Status"] == "available"
+    assert "_major_upgrade_pending" not in restored
 
 
 def test_rds_default_cluster_parameter_groups_are_immutable(rds):
