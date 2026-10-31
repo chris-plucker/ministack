@@ -15,6 +15,7 @@ import os
 import random
 import re
 import string
+import threading
 import time
 import zipfile
 from collections import defaultdict
@@ -4718,7 +4719,7 @@ def _cfn_noop_delete(physical_id, props):
 
 # --- CloudFormation Nested Stack (AWS::CloudFormation::Stack) ---
 
-def _check_nested_stack_capabilities(parent_stack_name, template):
+def _check_nested_stack_capabilities(parent_stack_name, template, capabilities=None):
     """Refuse a nested stack's template whose IAM resources the parent did
     not acknowledge. AWS asks for the capabilities on the parent ("For nested
     stacks that contain IAM resources, you must acknowledge IAM capabilities",
@@ -4739,7 +4740,9 @@ def _check_nested_stack_capabilities(parent_stack_name, template):
     required = _required_iam_capabilities(template)
     if _uses_macro(template):
         required.append("CAPABILITY_AUTO_EXPAND")
-    missing = _missing_capabilities(set(_parent_capabilities(parent_stack_name)), required)
+    if capabilities is None:
+        capabilities = _parent_capabilities(parent_stack_name)
+    missing = _missing_capabilities(set(capabilities), required)
     if missing:
         raise ValueError(_insufficient_capabilities_message(missing))
 
@@ -4762,9 +4765,9 @@ def _inherited_capabilities(parent_stack_name):
 
 def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
                              previous_physical_id=None, previous_props=None,
-                             template_body=None, child_name=None):
+                             template_body=None, child_name=None, capabilities=None):
     """Provision an `AWS::CloudFormation::Stack` nested-stack resource, or a
-    StackSet's instance (its own ``template_body`` and ``child_name``).
+    StackSet's instance (its own ``template_body``, ``child_name`` and ``capabilities``).
 
     Mirrors the synchronous core of `stacks._deploy_stack_async` but runs
     inline so the parent's deploy loop can read the child's Outputs (exposed
@@ -4808,7 +4811,7 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         raise ValueError(f"Nested-stack template empty at {template_url}")
 
     template = _parse_template(template_body)
-    _check_nested_stack_capabilities(parent_stack_name, template)
+    _check_nested_stack_capabilities(parent_stack_name, template, capabilities)
 
     raw_param_props = props.get("Parameters") or {}
     if isinstance(raw_param_props, dict):
@@ -4871,7 +4874,8 @@ def _cfn_nested_stack_deploy(logical_id, props, parent_stack_name, *,
         # child of this child reads the same set. Only the check needs it, so
         # it is recorded only where the check runs: elsewhere a child's
         # DescribeStacks reports what it reported before, nothing.
-        "Capabilities": _inherited_capabilities(parent_stack_name),
+        "Capabilities": (_inherited_capabilities(parent_stack_name)
+                         if capabilities is None else list(capabilities)),
     }
     _stacks[child_name] = child_stack
     _stack_events.setdefault(child_stack_id, [])
@@ -5132,6 +5136,7 @@ _STACK_SET_PROPERTIES = frozenset({
     "StackSetName", "PermissionModel", "StackInstancesGroup", "TemplateBody", "Parameters",
     "Capabilities", "Description", "Tags", "AdministrationRoleARN", "ExecutionRoleName",
     "ManagedExecution", "OperationPreferences"})
+_STACK_SET_NAMES = threading.Lock()
 
 
 def _stack_set_instance(props):
@@ -5157,15 +5162,16 @@ def _stack_set_create(logical_id, props, stack_name):
     from ministack.services.cloudformation import _stack_sets
     instance = _stack_set_instance(props)
     name = props["StackSetName"]
-    if any(r["StackSetName"] == name and r["Status"] == "ACTIVE" for r in _stack_sets.values()):
-        raise ValueError(f"StackSet {name} already exists")
     stack_set_id = f"{name}:{new_uuid()}"
     record = {"StackSetId": stack_set_id, "StackSetName": name, "Status": "ACTIVE",
               "Properties": props, "InstanceStack": f"StackSet-{name}-{new_uuid()}"}
-    _stack_sets[stack_set_id] = record
+    with _STACK_SET_NAMES:  # held only to reserve the name, not across the deploy
+        if any(r["StackSetName"] == name and r["Status"] == "ACTIVE" for r in _stack_sets.values()):
+            raise ValueError(f"StackSet {name} already exists")
+        _stack_sets[stack_set_id] = record
     try:
         _cfn_nested_stack_deploy(logical_id, instance, stack_name, template_body=props["TemplateBody"],
-                                 child_name=record["InstanceStack"])
+                                 child_name=record["InstanceStack"], capabilities=props.get("Capabilities") or [])
     except Exception:
         # The failed resource is not recorded, so the stack's rollback cannot delete it.
         _cfn_nested_stack_delete(record["InstanceStack"], {})
@@ -5181,7 +5187,8 @@ def _stack_set_update(physical_id, old_props, new_props, stack_name):
     # AWS stores the new properties before the instance is updated.
     record["Properties"] = new_props
     _cfn_nested_stack_deploy(physical_id, instance, stack_name, previous_physical_id=record["InstanceStack"],
-                             template_body=new_props["TemplateBody"])
+                             template_body=new_props["TemplateBody"],
+                             capabilities=new_props.get("Capabilities") or [])
     return physical_id, {"StackSetId": physical_id}
 
 
