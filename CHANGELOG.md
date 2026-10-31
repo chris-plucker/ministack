@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **EC2 — `DescribeInstanceTypes` reports Nitro and Graviton types as they are** — every type reported `Hypervisor` `xen` and `x86_64` only, so a client that requires Nitro (for example to allow an ElastiCache network type) rejected them all and a Graviton type looked like Intel; families built on the Nitro System now report `nitro`, the older Xen families (`t2`, `m4`, `c4`, `r4`, `i3` and their peers) `xen`, and Graviton families (`t4g`, `c7gn`, `r8gd`, `a1`, ...) `arm64`. Bare-metal sizes (`*.metal`, `*.metal-*`) report `BareMetal` true and no `Hypervisor`, Mac types `x86_64_mac` (`mac1`) or `arm64_mac`, and the nine small sizes that run 32-bit AMIs (`t1.micro`, `t2.nano` to `t2.medium`, `m1.small`, `m1.medium`, `c1.medium`, `c3.large`) also `i386`, matching every instance type real AWS lists in us-west-2.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
