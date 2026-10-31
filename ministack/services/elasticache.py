@@ -2504,16 +2504,19 @@ def _user_group_engine_commands(rg, account_id, region):
     major = (rg.get("EngineVersion") or "7").split(".")[0]
     deny = _ACL_DENY_V6 if rg.get("Engine") == "redis" and major.isdigit() and int(major) < 7 else _ACL_DENY
     commands = _user_group_acl_commands(account_id, region, rg.get("UserGroupIds"), deny)
+    # Replicas sync as the admin while `default` may be off, and as `default` again once detached.
+    replication = [_ACL_ADMIN, rg["_acl_admin"]]
     if not commands:
         tokens = [] if rg.get("_auth_optional") else rg.get("_auth_tokens") or []
         commands = [["ACL", "SETUSER", "default", "reset", "on", "~*", "&*", "+@all",
                      *([f">{t}" for t in tokens] or ["nopass"])]]
-    return commands
+        replication = ["", _record_auth(rg) or ""]
+    return commands + [["CONFIG", "SET", "masteruser", replication[0]], ["CONFIG", "SET", "masterauth", replication[1]]]
 
 
 def _apply_engine_commands(rg, commands):
     docker_client, admin = _get_docker(), rg["_acl_admin"]
-    keep = {"default", _ACL_ADMIN} | {c[2] for c in commands}
+    keep = {"default", _ACL_ADMIN} | {c[2] for c in commands if c[0] == "ACL"}
     transit = rg.get("TransitEncryptionEnabled", False)
     as_admin = [*_node_cli_args(transit, None), "--user", _ACL_ADMIN, "-a", admin, "--no-auth-warning"]
     for cid in rg.get("_docker_container_ids") or []:
@@ -2956,7 +2959,7 @@ def _reported_access_string(access):
     tokens = access.split()
     if any(t.lower() in ("+@all", "-@all", "allcommands", "nocommands") for t in tokens):
         return access
-    i = next((i for i, t in enumerate(tokens) if t[:1] in "+-"), len(tokens))
+    i = next((i for i, t in enumerate(tokens) if t[:1] in "+-("), len(tokens))  # before any (selector)
     return " ".join(tokens[:i] + ["-@all"] + tokens[i:])
 
 

@@ -2624,6 +2624,7 @@ def test_elasticache_acl_setuser_denies_inside_selectors_only():
     user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
     assert _ec._acl_setuser(user, ("-a", "-b")) == [
         "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+    assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
 
 
 def test_elasticache_user_group_acl_never_applies_the_internal_admin_name():
@@ -2648,11 +2649,12 @@ def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkey
             "Authentication": {"Type": "iam"}}
     _ec._users[user["UserId"]] = user
     _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [user["UserId"]]}
-    applied = []
+    applied, sent = [], []
 
     class Container:
         def exec_run(self, cmd):
             command = cmd[cmd.index("-p") + 2:]
+            sent.append(command)
             if command[:3] == ["ACL", "SETUSER", user["UserName"]]:
                 applied.append(command)
                 user["AccessString"] = "on ~app:* -@all +@read"  # a ModifyUser landing meanwhile
@@ -2665,5 +2667,7 @@ def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkey
     try:
         _ec._apply_user_groups(rg, get_account_id(), get_region())
         assert "~app:*" in applied[-1] and "+@all" not in applied[-1]
+        assert sent[-2:] == [["CONFIG", "SET", "masteruser", _ec._ACL_ADMIN],
+                             ["CONFIG", "SET", "masterauth", rg["_acl_admin"]]]  # replicas, with default off
     finally:
         del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
