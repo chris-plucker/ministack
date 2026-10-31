@@ -1323,6 +1323,11 @@ def test_rds_major_upgrade_reports_pending_then_upgrading_then_new_family(rds):
                                   Description="x")
     rds.modify_db_instance(DBInstanceIdentifier="seq-up-custom", DBParameterGroupName="seq-up-pg",
                            ApplyImmediately=True)
+    # With Docker the cluster's engine is still starting.
+    for _ in range(120):
+        if rds.describe_db_clusters(DBClusterIdentifier="seq-up")["DBClusters"][0]["Status"] == "available":
+            break
+        time.sleep(1)
 
     def steps(c):
         return (c["Status"], c["EngineVersion"], c["DBClusterParameterGroup"], c.get("PendingModifiedValues"))
