@@ -5675,6 +5675,8 @@ def _create_managed_prefix_list(p):
     }
     if tags:
         _tags[pl_id] = tags
+    # SDKs send creation tags as TagSpecification.N (ResourceType prefix-list).
+    _parse_tag_specs(p, "prefix-list", pl_id)
     return _xml(200, "CreateManagedPrefixListResponse", _prefix_list_xml(_prefix_lists[pl_id], tag="prefixList"))
 
 
@@ -5693,6 +5695,9 @@ def _describe_managed_prefix_lists(p):
         if filters.get("prefix-list-id") and pl_id not in filters["prefix-list-id"]:
             continue
         if filters.get("owner-id") and "AWS" not in filters["owner-id"]:
+            continue
+        # AWS-managed lists carry no tags, so any tag filter excludes them.
+        if not _resource_matches_tag_filters(pl_id, filters):
             continue
         items += f"""<item>
         <prefixListId>{pl_id}</prefixListId>
