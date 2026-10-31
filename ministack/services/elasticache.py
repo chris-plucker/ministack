@@ -1425,6 +1425,11 @@ def _create_replication_group(p):
             "and DOCKER_NETWORK to enable real CLUSTER SLOTS routing.",
             num_node_groups, rg_id,
         )
+    if use_real_cluster and ELASTICACHE_PUBLIC_ENDPOINT:
+        logger.warning(
+            "ElastiCache: RG %s is a real Redis Cluster, whose nodes announce container-network "
+            "addresses; MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT does not apply to it.", rg_id,
+        )
 
     if use_real_cluster:
         node_groups, container_ids = _build_real_cluster_rg(
