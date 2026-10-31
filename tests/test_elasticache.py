@@ -1985,6 +1985,59 @@ def test_elasticache_restore_state_wipes_stale_replication_group_container_ids(m
     assert ("000000000000", "us-east-1", "rg-1") not in _ec._pending_rg_respawn
 
 
+def test_elasticache_respawned_replication_group_reports_the_new_endpoint(monkeypatch):
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    monkeypatch.setattr(_ec, "_spawn_redis_container",
+                        lambda name, engine, engine_version, labels, **_: ("new-host", 6390, f"cid-{name}"))
+    old = {"Address": "old-host", "Port": 6379}
+    _ec.load_persisted_state({
+        "replication_groups": {
+            "rg-ep": {
+                "ReplicationGroupId": "rg-ep", "Engine": "redis", "EngineVersion": "7.1",
+                "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                                "NodeGroupMembers": [{"CacheClusterId": "rg-ep-0001-001", "ReadEndpoint": dict(old)}]}],
+                "_docker_container_ids": ["dead-cid"],
+            },
+        },
+    })
+    _ec._ensure_live_containers()
+    ng = _ec._replication_groups["rg-ep"]["NodeGroups"][0]
+    new = {"Address": "new-host", "Port": 6390}
+    assert ng["PrimaryEndpoint"] == ng["ReaderEndpoint"] == ng["NodeGroupMembers"][0]["ReadEndpoint"] == new
+
+
+def test_elasticache_endpoint_on_a_docker_network_is_a_stable_alias(monkeypatch):
+    from ministack.services import elasticache as _ec
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
+    from ministack.services import rds as _rds
+    monkeypatch.setattr(_rds, "_in_container", lambda: True)
+    runs = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                runs.append(kwargs)
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    first = _ec._spawn_redis_container("ministack-elasticache-x", "valkey", "8.0", labels={})
+    second = _ec._spawn_redis_container("ministack-elasticache-x", "valkey", "8.0", labels={})
+    alias = runs[0]["networking_config"]["net"]["Aliases"][0]
+    assert first[0] == second[0] == alias != "172.18.0.9"
+    assert alias == _ec._endpoint_alias("ministack-elasticache-x")
+
 def test_elasticache_restore_state_respawns_same_names_per_region(monkeypatch):
     from ministack.core.responses import AccountRegionScopedDict
     from ministack.services import elasticache as _ec
@@ -2545,3 +2598,157 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_builtin_network_keeps_ip_endpoint_without_alias(monkeypatch):
+    from ministack.services import elasticache as _ec
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
+    runs = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"bridge": {"IPAddress": "172.17.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                runs.append(kwargs)
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "bridge")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    host, _, cid = _ec._spawn_redis_container("ministack-elasticache-b", "valkey", "8.0", labels={})
+    assert "networking_config" not in runs[0]
+    assert (host, cid) == ("172.17.0.9", "cid")
+
+
+@pytest.mark.data_plane
+def test_elasticache_spawns_real_container_on_docker_bridge(monkeypatch):
+    docker = pytest.importorskip("docker")
+    from ministack.services import elasticache as _ec
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception:
+        pytest.skip("no Docker daemon")
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "bridge")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    import socket
+    with socket.socket() as sock:  # a free host port; sibling test runs share the daemon
+        sock.bind(("", 0))
+        free_port = sock.getsockname()[1]
+    monkeypatch.setattr(_ec, "_next_host_port", lambda: free_port)
+    name = f"ministack-elasticache-bridge-{_uuid_mod.uuid4().hex[:8]}"
+    host, _, cid = _ec._spawn_redis_container(name, "valkey", "8.0", labels={"ministack": "test"})
+    try:
+        # A fallback to the shared Redis returns no container id.
+        assert cid
+        assert host != _ec._endpoint_alias(name)
+    finally:
+        if cid:
+            _ec._teardown_containers(client, [cid])
+
+
+@pytest.mark.data_plane
+def test_elasticache_public_endpoint_is_reachable_from_the_host(monkeypatch):
+    """MINISTACK_ELASTICACHE_PUBLIC_ENDPOINT: a client outside the Docker network, which cannot
+    resolve the alias, reaches the engine through the published port."""
+    docker = pytest.importorskip("docker")
+    import socket
+    from ministack.services import elasticache as _ec
+    try:
+        client = docker.from_env()
+        client.ping()
+    except Exception:
+        pytest.skip("no Docker daemon")
+    net = client.networks.create(f"ec-pub-{_uuid_mod.uuid4().hex[:8]}")
+    with socket.socket() as sock:
+        sock.bind(("", 0))
+        free_port = sock.getsockname()[1]
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", net.name)
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", True)
+    try:  # the daemon host as seen from here: Docker Desktop's name when pytest is in a container
+        daemon_host = socket.gethostbyname("host.docker.internal")
+    except OSError:
+        daemon_host = "127.0.0.1"
+    monkeypatch.setattr(_ec, "_MINISTACK_HOST", daemon_host)
+    monkeypatch.setattr(_ec, "_next_host_port", lambda: free_port)
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    host, port, cid = _ec._spawn_redis_container(
+        f"ministack-elasticache-pub-{_uuid_mod.uuid4().hex[:8]}", "valkey", "8.0", labels={"ministack": "test"})
+    try:
+        assert cid and (host, port) == (daemon_host, free_port)
+        deadline = time.time() + 30
+        while True:
+            try:
+                with socket.create_connection((host, port), timeout=2) as conn:
+                    conn.sendall(b"PING\r\n")
+                    assert conn.recv(16).startswith(b"+PONG")
+                    break
+            except OSError:
+                assert time.time() < deadline
+                time.sleep(0.5)
+    finally:
+        if cid:
+            _ec._teardown_containers(client, [cid])
+        net.remove()
+
+
+def test_elasticache_serverless_public_endpoint_announces_the_published_port(monkeypatch):
+    from ministack.services import elasticache as _ec
+    puts = []
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+        def put_archive(self, path, data):
+            puts.append(data)
+            return True
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", True)
+    monkeypatch.setattr(_ec, "_MINISTACK_HOST", "ms.example")
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    address, port, _ = _ec._spawn_serverless_container("sls", "valkey", "8.0", 16999, labels={}, wait=False)
+    assert (address, port) == ("ms.example", 16999)
+
+
+def test_elasticache_host_run_ministack_keeps_the_container_address(monkeypatch):
+    """A host-run MiniStack's clients (and Lambda containers) reached the container IP before
+    aliases; they still do."""
+    from ministack.services import elasticache as _ec
+    from ministack.services import rds as _rds
+
+    class _Container:
+        id = "cid"
+        attrs = {"NetworkSettings": {"Networks": {"net": {"IPAddress": "172.18.0.9"}}}}
+
+        def reload(self):
+            pass
+
+    class _Client:
+        class containers:
+            @staticmethod
+            def run(**kwargs):
+                assert "networking_config" not in kwargs
+                return _Container()
+
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "net")
+    monkeypatch.setattr(_ec, "ELASTICACHE_PUBLIC_ENDPOINT", False)
+    monkeypatch.setattr(_rds, "_in_container", lambda: False)
+    monkeypatch.setattr(_ec, "_get_docker", lambda: _Client())
+    assert _ec._spawn_redis_container("ministack-elasticache-h", "valkey", "8.0", labels={})[0] == "172.18.0.9"
