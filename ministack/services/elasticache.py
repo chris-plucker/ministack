@@ -2440,9 +2440,14 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
 def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
-    rules = ["reset"]
+    rules, in_selector = ["reset"], False
     for token in user.get("AccessString", "").split():  # each (selector) grants on its own: deny there too
-        rules += [token[:-1], *deny[:-1], deny[-1] + ")"] if deny and token.endswith(")") else [token]
+        in_selector = in_selector or token.startswith("(")
+        if deny and in_selector and token.endswith(")"):
+            rules += [token[:-1], *deny[:-1], deny[-1] + ")"]
+            in_selector = False
+        else:
+            rules.append(token)
     rules += deny
     if user.get("Authentication", {}).get("Type") == "password" and user.get("_PasswordHashes"):
         rules += [f"#{h}" for h in user["_PasswordHashes"]]
@@ -2476,7 +2481,14 @@ _ACL_DENY_V6 = ("-acl", "-config")
 
 def _apply_user_groups(rg, account_id, region):
     """Configure a replication group's engines for its user groups, synchronously as for AUTH tokens:
-    the groups' users only, and once no group is attached, `default` back with the AUTH token, if any."""
+    the groups' users only, and once no group is attached, `default` back with the AUTH token, if any.
+    One at a time per group, each reading the state when it starts, so an older change never lands last.
+    The lock is held across docker exec: engines never call back into MiniStack."""
+    with resource_lock("elasticache-acl", rg["ARN"]):
+        _apply_user_groups_locked(rg, account_id, region)
+
+
+def _apply_user_groups_locked(rg, account_id, region):
     docker_client = _get_docker()
     if not docker_client or not (rg.get("UserGroupIds") or rg.get("_acl_admin")):
         return
