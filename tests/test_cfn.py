@@ -37930,3 +37930,35 @@ def test_cfn_stackset_refuses_what_it_does_not_deploy(cfn):
             assert exc.value.response["Error"]["Code"] == "StackSetNotFoundException"
         finally:
             _delete_cfn_test_stack(cfn, name)
+
+
+@pytest.mark.auth_contract
+def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_user):
+    """The StackSet's own Capabilities acknowledge its instance's IAM resources, and DescribeStackSet and
+    ListStackInstances are authorized against the StackSet's ARN (ending in its StackSetId) under AUTH=true."""
+    suffix = _uuid_mod.uuid4().hex[:8]
+    name, set_name = f"cfn-ss-auth-{suffix}", f"ss-auth-{suffix}"
+    instance = {"Resources": {"Role": {"Type": "AWS::IAM::Role", "Properties": {"AssumeRolePolicyDocument": {
+        "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+                                                "Principal": {"Service": "lambda.amazonaws.com"}}]}}}}}
+    template = json.loads(_stack_set_template(set_name, f"q-auth-{suffix}", TemplateBody=json.dumps(instance),
+                                              Capabilities=["CAPABILITY_IAM"]))
+    del template["Resources"]["Set"]["Properties"]["Parameters"]
+    cfn.create_stack(StackName=name, TemplateBody=json.dumps(template))
+    try:
+        assert _wait_stack(cfn, name)["StackStatus"] == "CREATE_COMPLETE"
+        arn = cfn.describe_stack_set(StackSetName=set_name)["StackSet"]["StackSetARN"]
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": ["cloudformation:DescribeStackSet", "cloudformation:ListStackInstances"],
+             "Resource": arn}]}).client("cloudformation")
+        for call in (user.describe_stack_set, user.list_stack_instances):
+            for ref in (set_name, arn.split("stackset/")[1]):
+                if auth_enabled:
+                    with pytest.raises(ClientError) as exc:
+                        call(StackSetName=ref)
+                    assert exc.value.response["Error"]["Code"] == "AccessDenied"
+                else:
+                    call(StackSetName=ref)
+    finally:
+        _delete_cfn_test_stack(cfn, name)
