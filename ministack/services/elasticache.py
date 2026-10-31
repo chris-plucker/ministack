@@ -3029,7 +3029,8 @@ def _delete_user(p):
     if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
         return _error("DefaultUserAssociatedToUserGroup",
                       "User is associated to user group(s) as a default user and can't be deleted.", 400)
-    del _users[user_id]
+    if _users.pop(user_id, None) is None:  # deleted meanwhile by a concurrent request
+        return _error("UserNotFound", f"User {user_id} not found", 404)
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
     _apply_user_groups_of(user.get("UserGroupIds", []))
