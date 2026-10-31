@@ -37960,5 +37960,18 @@ def test_cfn_stackset_capabilities_and_reads_contract(auth_enabled, cfn, iam_use
                     assert exc.value.response["Error"]["Code"] == "AccessDenied"
                 else:
                     call(StackSetName=ref)
+        # A StackSetName on another action does not change what that action is authorized against.
+        stack_arn = cfn.describe_stacks(StackName=name)["Stacks"][0]["StackId"].rsplit("/", 1)[0] + "/*"
+        user = iam_user(policy={"Version": "2012-10-17", "Statement": [
+            {"Effect": "Allow", "Action": "cloudformation:*", "Resource": "*"},
+            {"Effect": "Deny", "Action": "cloudformation:DescribeStacks", "Resource": stack_arn}]}).client("cloudformation")
+        user.meta.events.register("before-sign.cloudformation.DescribeStacks",
+                                  lambda request, **_: request.data.update({"StackSetName": set_name}))
+        if auth_enabled:
+            with pytest.raises(ClientError) as exc:
+                user.describe_stacks(StackName=name)
+            assert exc.value.response["Error"]["Code"] == "AccessDenied"
+        else:
+            user.describe_stacks(StackName=name)
     finally:
         _delete_cfn_test_stack(cfn, name)
