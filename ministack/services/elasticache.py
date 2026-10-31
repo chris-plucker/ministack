@@ -2483,17 +2483,24 @@ _ACL_DENY_V6 = ("-acl", "-config")
 def _apply_user_groups(rg, account_id, region):
     """Configure a replication group's engines for its user groups, synchronously as for AUTH tokens:
     the groups' users only, and once no group is attached, `default` back with the AUTH token, if any.
-    One at a time per group, each reading the state when it starts, so an older change never lands last.
-    The lock is held across docker exec: engines never call back into MiniStack."""
-    with resource_lock("elasticache-acl", rg["ARN"]):
-        _apply_user_groups_locked(rg, account_id, region)
+    It converges without a lock: once applied, the commands are worked out again from the state, and
+    applied again if they changed meanwhile, so an older application landing last puts the current one back."""
+    applied = None
+    for _ in range(3):
+        commands = _user_group_engine_commands(rg, account_id, region)
+        if commands is None or commands == applied:
+            return
+        _apply_engine_commands(rg, commands)
+        applied = commands
+    if _user_group_engine_commands(rg, account_id, region) != applied:
+        logger.warning("ElastiCache: user groups of %s still changing; not re-applied", rg["ReplicationGroupId"])
 
 
-def _apply_user_groups_locked(rg, account_id, region):
-    docker_client = _get_docker()
-    if not docker_client or not (rg.get("UserGroupIds") or rg.get("_acl_admin")):
-        return
-    admin = rg.setdefault("_acl_admin", secrets.token_hex(16))
+def _user_group_engine_commands(rg, account_id, region):
+    """The ACL commands a replication group's engines need now, or None when it has nothing to apply."""
+    if not _get_docker() or not (rg.get("UserGroupIds") or rg.get("_acl_admin")):
+        return None
+    rg.setdefault("_acl_admin", secrets.token_hex(16))
     major = (rg.get("EngineVersion") or "7").split(".")[0]
     deny = _ACL_DENY_V6 if rg.get("Engine") == "redis" and major.isdigit() and int(major) < 7 else _ACL_DENY
     commands = _user_group_acl_commands(account_id, region, rg.get("UserGroupIds"), deny)
@@ -2501,6 +2508,11 @@ def _apply_user_groups_locked(rg, account_id, region):
         tokens = [] if rg.get("_auth_optional") else rg.get("_auth_tokens") or []
         commands = [["ACL", "SETUSER", "default", "reset", "on", "~*", "&*", "+@all",
                      *([f">{t}" for t in tokens] or ["nopass"])]]
+    return commands
+
+
+def _apply_engine_commands(rg, commands):
+    docker_client, admin = _get_docker(), rg["_acl_admin"]
     keep = {"default", _ACL_ADMIN} | {c[2] for c in commands}
     transit = rg.get("TransitEncryptionEnabled", False)
     as_admin = [*_node_cli_args(transit, None), "--user", _ACL_ADMIN, "-a", admin, "--no-auth-warning"]
