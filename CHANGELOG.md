@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **RDS — PostgreSQL databases have `rds_superuser` and `rds_iam`** — on an RDS or Aurora PostgreSQL database the master user was a plain superuser and neither role existed, so `GRANT rds_iam TO <user>`, the documented step for IAM database authentication, failed with `role "rds_iam" does not exist`; both roles now exist on a new database, with `rds_replication` and `rds_password`, which `rds_superuser` holds with admin option, and the master user is a member of `rds_superuser`, as on a real Aurora PostgreSQL 16 cluster. The roles are created when a database's data directory is initialized, so a database whose data predates this change gets them only once it is recreated.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
