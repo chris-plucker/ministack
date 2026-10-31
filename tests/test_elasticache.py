@@ -2545,3 +2545,73 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_user_group_changes_answer_as_aws(ec):
+    """Real AWS (us-west-2): access strings are reported with `-@all`, user-group changes answer pending,
+    a group's default user cannot be deleted, and UserGroupIds is absent once the last group is detached."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    default, app, group, rg_id = f"d-{uid}", f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=default, UserName="default", Engine="valkey", AccessString="off -@all", Passwords=[pw])
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[default, app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        assert ec.modify_user(UserId=app, AccessString="on ~app:* +@read")["AccessString"] == "on ~app:* -@all +@read"
+        removed = ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert (removed["Status"], removed["UserIds"], removed["PendingChanges"]) == (
+            "modifying", [default, app], {"UserIdsToRemove": [app]})
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user(UserId=default)
+        assert exc.value.response["Error"]["Code"] == "DefaultUserAssociatedToUserGroup"
+        detached = ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group],
+                                               ApplyImmediately=True)["ReplicationGroup"]
+        assert (detached["Status"], detached["UserGroupIds"], detached["PendingModifiedValues"]) == (
+            "modifying", [group], {"UserGroups": {"UserGroupIdsToAdd": [], "UserGroupIdsToRemove": [group]}})
+        assert "UserGroupIds" not in ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (default, app):
+            ec.delete_user(UserId=user)
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path):
+    """A replication group's user group is configured on its engine and follows every change: default is
+    off without a default user, application users cannot change users, and detaching restores default."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        ok, deadline = b"+OK\r\n", time.time() + 30
+        while True:
+            try:
+                unauthenticated = _tls_session(ep, ca, ("SET", "k", "v"))[0]
+                break
+            except OSError:  # still starting
+                assert time.time() < deadline
+                time.sleep(0.5)
+        assert unauthenticated.startswith(b"-NOAUTH")
+        assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
+        took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
+        assert took[1].startswith(b"-NOPERM")
+
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")  # re-applied with default off
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert _tls_session(ep, ca, ("AUTH", app, pw))[0].startswith(b"-WRONGPASS")
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+        assert _tls_session(ep, ca, ("SET", "k", "v")) == [ok]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)

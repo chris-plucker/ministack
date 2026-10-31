@@ -35,6 +35,7 @@ import io
 import ipaddress
 import logging
 import os
+import secrets
 import tarfile
 import time
 from urllib.parse import parse_qs
@@ -343,6 +344,7 @@ def _ensure_live_containers_locked():
                 )
                 if cid:
                     rg["_docker_container_ids"].append(cid)
+            _apply_user_groups(rg, account_id, region)  # the new engines have none of the groups' users
             log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(
@@ -1562,6 +1564,7 @@ def _create_replication_group(p):
 
     _record_event(rg_id, "replication-group", "Replication group created")
     _stamp_replication_group_on_user_groups(rg_id, user_group_ids)
+    _apply_user_groups(_replication_groups[rg_id], get_account_id(), get_region())
     return _xml(200, "CreateReplicationGroupResponse",
         f"<CreateReplicationGroupResult><ReplicationGroup>{_rg_xml(_replication_groups[rg_id])}</ReplicationGroup></CreateReplicationGroupResult>")
 
@@ -1645,6 +1648,7 @@ def _modify_replication_group(p):
     user_group_ids_to_remove = _extract_configs(p, "UserGroupIdsToRemove", ("member",))
 
     rg_user_group_ids = rg.setdefault("UserGroupIds", [])
+    groups_before = list(rg_user_group_ids)
     for group_id in user_group_ids_to_add:
         if group_id not in rg_user_group_ids:
             rg_user_group_ids.append(group_id)
@@ -1656,8 +1660,16 @@ def _modify_replication_group(p):
         _unstamp_replication_group_from_user_groups(rg_id, [group_id])
 
     _record_event(rg_id, "replication-group", "Replication group modified")
+    shown = rg
+    if groups_before != rg_user_group_ids:
+        _apply_user_groups(rg, get_account_id(), get_region())
+        # AWS answers with the group still modifying and the change pending (real AWS, us-west-2);
+        # MiniStack settles at once.
+        shown = {**rg, "Status": "modifying", "UserGroupIds": groups_before, "PendingModifiedValues": {"UserGroups": {
+            "UserGroupIdsToAdd": [g for g in rg_user_group_ids if g not in groups_before],
+            "UserGroupIdsToRemove": [g for g in groups_before if g not in rg_user_group_ids]}}}
     return _xml(200, "ModifyReplicationGroupResponse",
-        f"<ModifyReplicationGroupResult><ReplicationGroup>{_rg_xml(rg)}</ReplicationGroup></ModifyReplicationGroupResult>")
+        f"<ModifyReplicationGroupResult><ReplicationGroup>{_rg_xml(shown)}</ReplicationGroup></ModifyReplicationGroupResult>")
 
 
 def _update_auth_token(rg, token, strategy):
@@ -2424,10 +2436,10 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
     return address, port, container.id
 
 
-def _acl_setuser(user):
+def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
-    rules = ["reset", *user.get("AccessString", "").split()]
+    rules = ["reset", *user.get("AccessString", "").split(), *deny]
     if user.get("Authentication", {}).get("Type") == "password" and user.get("_PasswordHashes"):
         rules += [f"#{h}" for h in user["_PasswordHashes"]]
     else:
@@ -2435,24 +2447,83 @@ def _acl_setuser(user):
     return ["ACL", "SETUSER", user.get("UserName") or user["UserId"], *rules]
 
 
-def _user_group_acl_commands(account_id, region, group_id):
-    """The engine ACL for a cache with a user group: the group's users, then `default` last. A group
-    without a user named default turns it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
-    group = _user_groups.get_scoped(account_id, region, group_id) if group_id else None
-    if not group:
+def _user_group_acl_commands(account_id, region, group_ids, deny=()):
+    """The engine ACL for a cache with user groups: the groups' users, then `default` last. Groups
+    without a user named default turn it off (AWS RBAC docs: attaching a Valkey user group disables it)."""
+    if not any(group_ids or []):
         return []
-    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in group.get("UserIds", [])) if u]
+    user_ids = dict.fromkeys(uid for gid in group_ids
+                             for uid in (_user_groups.get_scoped(account_id, region, gid) or {}).get("UserIds", []))
+    users = [u for u in (_users.get_scoped(account_id, region, uid) for uid in user_ids) if u]
     default = next((u for u in users if u.get("UserName") == "default"), None)
-    commands = [_acl_setuser(u) for u in users if u.get("UserName") != "default"]
-    commands.append(_acl_setuser(default) if default else ["ACL", "SETUSER", "default", "reset"])
+    commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
+    commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset"])
     return commands
+
+
+# The internal user MiniStack administers a replication group's engines as, since `default` may be off.
+# AWS rejects this name for a user (it must begin with a letter), so no application user can take it.
+_ACL_ADMIN = "_ministack-admin"
+# Restricted commands an application user could take over users or the server's auth with
+# (AWS docs, "Restricted commands"). Redis below 7 cannot deny a subcommand alone.
+_ACL_DENY = ("-acl|setuser", "-acl|deluser", "-acl|load", "-acl|save", "-config")
+_ACL_DENY_V6 = ("-acl", "-config")
+
+
+def _apply_user_groups(rg, account_id, region):
+    """Configure a replication group's engines for its user groups, synchronously as for AUTH tokens:
+    the groups' users only, and once no group is attached, `default` back with the AUTH token, if any."""
+    docker_client = _get_docker()
+    if not docker_client or not (rg.get("UserGroupIds") or rg.get("_acl_admin")):
+        return
+    admin = rg.setdefault("_acl_admin", secrets.token_hex(16))
+    major = (rg.get("EngineVersion") or "7").split(".")[0]
+    deny = _ACL_DENY_V6 if rg.get("Engine") == "redis" and major.isdigit() and int(major) < 7 else _ACL_DENY
+    commands = _user_group_acl_commands(account_id, region, rg.get("UserGroupIds"), deny)
+    if not commands:
+        tokens = [] if rg.get("_auth_optional") else rg.get("_auth_tokens") or []
+        commands = [["ACL", "SETUSER", "default", "reset", "on", "~*", "&*", "+@all",
+                     *([f">{t}" for t in tokens] or ["nopass"])]]
+    keep = {"default", _ACL_ADMIN} | {c[2] for c in commands}
+    transit = rg.get("TransitEncryptionEnabled", False)
+    as_admin = [*_node_cli_args(transit, None), "--user", _ACL_ADMIN, "-a", admin, "--no-auth-warning"]
+    for cid in rg.get("_docker_container_ids") or []:
+        try:
+            container = docker_client.containers.get(cid)
+
+            def run(cli_args, *command):
+                result = container.exec_run(["redis-cli", *cli_args, "-p", "6379", *command])
+                return result.output.decode(errors="replace").strip()
+            # The admin, created by the open default user (or the AUTH token) on a new engine, which
+            # may still be starting.
+            setup = ["ACL", "SETUSER", _ACL_ADMIN, "reset", "on", f">{admin}", "~*", "&*", "+@all"]
+            deadline = time.time() + 30
+            while run(as_admin, *setup) != "OK" and run(_node_cli_args(transit, _record_auth(rg)), *setup) != "OK":
+                if time.time() > deadline:
+                    raise RuntimeError("the engine did not accept the admin user")
+                time.sleep(0.5)
+            for name in run(as_admin, "ACL", "USERS").split():
+                if name not in keep:
+                    run(as_admin, "ACL", "DELUSER", name)  # a user no group has any more
+            for command in commands:
+                reply = run(as_admin, *command)
+                if reply != "OK":
+                    logger.warning("ElastiCache: %s on %s answered %s", command[:3], cid, reply[:200])
+        except Exception as e:
+            logger.warning("ElastiCache: user groups not applied on %s: %s", cid, e)
+
+
+def _apply_user_groups_of(group_ids):
+    for rg in list(_replication_groups.values()):
+        if set(group_ids) & set(rg.get("UserGroupIds") or []):
+            _apply_user_groups(rg, get_account_id(), get_region())
 
 
 def _start_serverless_container(record, account_id, region, wait=True):
     """Start ``record``'s container and publish its endpoint, unless the cache
     was deleted meanwhile — then the container is removed instead."""
     name = record["ServerlessCacheName"]
-    acl_commands = _user_group_acl_commands(account_id, region, record.get("UserGroupId"))
+    acl_commands = _user_group_acl_commands(account_id, region, [record.get("UserGroupId")])
     address, port, cid = _spawn_serverless_container(
         name=_serverless_container_name(account_id, region, name),
         engine=record["Engine"],
@@ -2850,6 +2921,16 @@ def _password_hashes(p):
     return [hashlib.sha256(_p(p, k).encode()).hexdigest() for k in keys if _p(p, k)]
 
 
+def _reported_access_string(access):
+    """The access string as AWS reports it, with the `-@all` its command rules build on (real AWS,
+    us-west-2: `on ~app:* +@read` is reported as `on ~app:* -@all +@read`)."""
+    tokens = access.split()
+    if any(t.lower() in ("+@all", "-@all", "allcommands", "nocommands") for t in tokens):
+        return access
+    i = next((i for i, t in enumerate(tokens) if t[:1] in "+-"), len(tokens))
+    return " ".join(tokens[:i] + ["-@all"] + tokens[i:])
+
+
 def _minimum_engine_version(user):
     if user.get("Engine") == "valkey":
         return "7.2"
@@ -2876,7 +2957,7 @@ def _create_user(p):
         "UserName": user_name,
         "Engine": engine,
         "Status": "active",
-        "AccessString": _p(p, "AccessString") or "on ~* +@all",
+        "AccessString": _reported_access_string(_p(p, "AccessString") or "on ~* +@all"),
         "UserGroupIds": [],
         "Authentication": auth or {"Type": "no-password", "PasswordCount": 0},
         "ARN": arn,
@@ -2910,11 +2991,16 @@ def _describe_users(p):
 
 def _delete_user(p):
     user_id = _p(p, "UserId")
-    user = _users.pop(user_id, None)
+    user = _users.get(user_id)
     if not user:
         return _error("UserNotFound", f"User {user_id} not found", 404)
+    if user.get("UserName") == "default" and user.get("UserGroupIds"):  # real AWS, us-west-2
+        return _error("DefaultUserAssociatedToUserGroup",
+                      "User is associated to user group(s) as a default user and can't be deleted.", 400)
+    del _users[user_id]
     _tags.pop(user.get("ARN", ""), None)
     user["Status"] = "deleting"
+    _apply_user_groups_of(user.get("UserGroupIds", []))
     return _xml(200, "DeleteUserResponse", f"<DeleteUserResult>{_user_xml(user)}</DeleteUserResult>")
 
 
@@ -2928,10 +3014,11 @@ def _modify_user(p):
     if err:
         return err
     if _p(p, "AccessString"):
-        user["AccessString"] = _p(p, "AccessString")
+        user["AccessString"] = _reported_access_string(_p(p, "AccessString"))
     if auth:
         user["Authentication"] = auth
         user["_PasswordHashes"] = _password_hashes(p)
+    _apply_user_groups_of(user.get("UserGroupIds", []))
 
     # AWS answers a modify with the user still modifying; MiniStack settles at once.
     return _xml(200, "ModifyUserResponse",
@@ -3002,6 +3089,7 @@ def _delete_user_group(p):
                 gids.remove(group_id)
 
     group["Status"] = "deleting"
+    _apply_user_groups_of([group_id])
     return _xml(200, "DeleteUserGroupResponse", f"<DeleteUserGroupResult>{_user_group_xml(group)}</DeleteUserGroupResult>")
 
 
@@ -3023,6 +3111,7 @@ def _modify_user_group(p):
         to_remove.append(_p(p, f"UserIdsToRemove.member.{idx}"))
         idx += 1
 
+    before = list(group["UserIds"])
     for uid in to_add:
         if uid not in group["UserIds"]:
             group["UserIds"].append(uid)
@@ -3037,7 +3126,13 @@ def _modify_user_group(p):
             if group_id in gids:
                 gids.remove(group_id)
 
-    return _xml(200, "ModifyUserGroupResponse", f"<ModifyUserGroupResult>{_user_group_xml(group)}</ModifyUserGroupResult>")
+    _apply_user_groups_of([group_id])
+    # AWS answers with the group still modifying and the change pending (real AWS, us-west-2);
+    # MiniStack settles at once.
+    pending = {"UserIdsToAdd": [u for u in group["UserIds"] if u not in before],
+               "UserIdsToRemove": [u for u in before if u not in group["UserIds"]]}
+    shown = {**group, "Status": "modifying", "UserIds": before, "PendingChanges": pending} if group["UserIds"] != before else group
+    return _xml(200, "ModifyUserGroupResponse", f"<ModifyUserGroupResult>{_user_group_xml(shown)}</ModifyUserGroupResult>")
 
 
 def _user_xml(u):
@@ -3063,12 +3158,15 @@ def _user_xml(u):
 def _user_group_xml(g):
     user_ids_xml = "".join(f"<member>{uid}</member>" for uid in g.get("UserIds", []))
     rg_xml = "".join(f"<member>{rg}</member>" for rg in g.get("ReplicationGroups", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{u}</member>" for u in ids) + f"</{k}>"
+                          for k, ids in (g.get("PendingChanges") or {}).items() if ids)
     return (
         f"<UserGroupId>{g['UserGroupId']}</UserGroupId>"
         f"<Status>{g.get('Status', 'active')}</Status>"
         f"<Engine>{g.get('Engine', 'redis')}</Engine>"
         f"<UserIds>{user_ids_xml}</UserIds>"
-        f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
+        + (f"<PendingChanges>{pending_xml}</PendingChanges>" if pending_xml else "")
+        + f"<ReplicationGroups>{rg_xml}</ReplicationGroups>"
         f"<ARN>{g.get('ARN', '')}</ARN>"
     )
 
@@ -3238,6 +3336,8 @@ def _rg_xml(rg):
     for user_group_id in rg.get("UserGroupIds", []):
         user_group_ids_xml += f"<member>{user_group_id}</member>"
     log_delivery_configs_xml = _log_delivery_configs_xml(rg.get("LogDeliveryConfigurations", []))
+    pending_xml = "".join(f"<{k}>" + "".join(f"<member>{g}</member>" for g in ids) + f"</{k}>"
+                          for k, ids in (rg.get("PendingModifiedValues") or {}).get("UserGroups", {}).items())
     return (
         f"<ReplicationGroupId>{rg['ReplicationGroupId']}</ReplicationGroupId>"
         f"<Description>{rg.get('Description', '')}</Description>"
@@ -3259,8 +3359,10 @@ def _rg_xml(rg):
         f"<MemberClusters>{member_clusters_xml}</MemberClusters>"
         f"<NodeGroups>{node_groups_xml}</NodeGroups>"
         f"<LogDeliveryConfigurations>{log_delivery_configs_xml}</LogDeliveryConfigurations>"
-        f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>"
-        f"<ARN>{rg['ARN']}</ARN>"
+        # AWS leaves UserGroupIds out once none is attached (real AWS, us-west-2).
+        + (f"<UserGroupIds>{user_group_ids_xml}</UserGroupIds>" if user_group_ids_xml else "")
+        + (f"<PendingModifiedValues><UserGroups>{pending_xml}</UserGroups></PendingModifiedValues>" if pending_xml else "")
+        + f"<ARN>{rg['ARN']}</ARN>"
     )
 
 
