@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **CloudFormation — `AWS::CloudFormation::StackSet` with one stack instance in its own account and Region** — a template with a StackSet was refused as an unrecognized resource type. A `SELF_MANAGED` StackSet whose one `StackInstancesGroup` targets the stack's own account and Region now deploys its inline `TemplateBody` as a stack instance through the nested-stack engine, which updates it, rolls a failed update back with the stack and deletes it. `Ref` returns the `StackSetId`; `DescribeStackSet` (by name, or by `StackSetId` also once deleted) and `ListStackInstances` answer with the shapes of a real-AWS capture. Any other StackSet fails the resource with an error naming what is deployed.
+
 ## [1.5.35] — 2026-10-30
 
 ### Added
