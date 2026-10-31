@@ -2,6 +2,7 @@ import io
 import json
 import os
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 
@@ -2615,3 +2616,54 @@ def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path
         ec.delete_replication_group(ReplicationGroupId=rg_id)
         ec.delete_user_group(UserGroupId=group)
         ec.delete_user(UserId=app)
+
+
+def test_elasticache_acl_setuser_denies_inside_selectors_only():
+    """Restricted commands are denied inside each (selector), and a key pattern ending in `)` is no selector."""
+    from ministack.services import elasticache as _ec
+    user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
+    assert _ec._acl_setuser(user, ("-a", "-b")) == [
+        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+
+
+def test_elasticache_user_group_acl_never_applies_the_internal_admin_name():
+    from ministack.services import elasticache as _ec
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    _ec._users[f"x-{uid}"] = {"UserId": f"x-{uid}", "UserName": _ec._ACL_ADMIN, "AccessString": "on ~* +@all"}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"x-{uid}"]}
+    try:
+        assert _ec._user_group_acl_commands(get_account_id(), get_region(), [f"g-{uid}"]) == [
+            ["ACL", "SETUSER", "default", "reset"]]
+    finally:
+        del _ec._users[f"x-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
+def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkeypatch):
+    """A change that lands while the engine is being configured is applied too, without a lock."""
+    from ministack.services import elasticache as _ec
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    user = {"UserId": f"a-{uid}", "UserName": f"a-{uid}", "AccessString": "on ~* +@all",
+            "Authentication": {"Type": "iam"}}
+    _ec._users[user["UserId"]] = user
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [user["UserId"]]}
+    applied = []
+
+    class Container:
+        def exec_run(self, cmd):
+            command = cmd[cmd.index("-p") + 2:]
+            if command[:3] == ["ACL", "SETUSER", user["UserName"]]:
+                applied.append(command)
+                user["AccessString"] = "on ~app:* -@all +@read"  # a ModifyUser landing meanwhile
+            return types.SimpleNamespace(output=b"" if command[:2] == ["ACL", "USERS"] else b"OK")
+
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: Container()))
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    rg = {"ReplicationGroupId": f"rg-{uid}", "Engine": "valkey", "EngineVersion": "8.0",
+          "UserGroupIds": [f"g-{uid}"], "_docker_container_ids": ["c1"]}
+    try:
+        _ec._apply_user_groups(rg, get_account_id(), get_region())
+        assert "~app:*" in applied[-1] and "+@all" not in applied[-1]
+    finally:
+        del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
