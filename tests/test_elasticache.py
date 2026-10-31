@@ -2,6 +2,7 @@ import io
 import json
 import os
 import time
+import types
 import uuid as _uuid_mod
 import zipfile
 
@@ -2545,3 +2546,128 @@ def test_elasticache_user_modes_and_modify_follow_aws(ec):
         assert ec.describe_users(UserId=uid)["Users"][0]["Authentication"] == {"Type": "iam"}
     finally:
         ec.delete_user(UserId=uid)
+
+
+def test_elasticache_user_group_changes_answer_as_aws(ec):
+    """Real AWS (us-west-2): access strings are reported with `-@all`, user-group changes answer pending,
+    a group's default user cannot be deleted, and UserGroupIds is absent once the last group is detached."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    default, app, group, rg_id = f"d-{uid}", f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=default, UserName="default", Engine="valkey", AccessString="off -@all", Passwords=[pw])
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[default, app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        assert ec.modify_user(UserId=app, AccessString="on ~app:* +@read")["AccessString"] == "on ~app:* -@all +@read"
+        removed = ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert (removed["Status"], removed["UserIds"], removed["PendingChanges"]) == (
+            "modifying", [default, app], {"UserIdsToRemove": [app]})
+        with pytest.raises(ClientError) as exc:
+            ec.delete_user(UserId=default)
+        assert exc.value.response["Error"]["Code"] == "DefaultUserAssociatedToUserGroup"
+        detached = ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group],
+                                               ApplyImmediately=True)["ReplicationGroup"]
+        assert (detached["Status"], detached["UserGroupIds"], detached["PendingModifiedValues"]) == (
+            "modifying", [group], {"UserGroups": {"UserGroupIdsToAdd": [], "UserGroupIdsToRemove": [group]}})
+        assert "UserGroupIds" not in ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        for user in (default, app):
+            ec.delete_user(UserId=user)
+
+
+@requires_docker
+@pytest.mark.data_plane
+def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path):
+    """A replication group's user group is configured on its engine and follows every change: default is
+    off without a default user, application users cannot change users, and detaching restores default."""
+    uid, pw = _uid(), "a-long-enough-password-1"
+    app, group, rg_id = f"a-{uid}", f"g-{uid}", f"rg-{uid}"
+    ec.create_user(UserId=app, UserName=app, Engine="valkey", AccessString="on ~* +@all (~* +@all)", Passwords=[pw])
+    ec.create_user_group(UserGroupId=group, Engine="valkey", UserIds=[app])
+    ec.create_replication_group(ReplicationGroupId=rg_id, ReplicationGroupDescription="ug", Engine="valkey",
+                                CacheNodeType="cache.t4g.micro", TransitEncryptionEnabled=True, UserGroupIds=[group])
+    try:
+        ep = ec.describe_replication_groups(ReplicationGroupId=rg_id)["ReplicationGroups"][0]["NodeGroups"][0]["PrimaryEndpoint"]
+        ca = _serverless_ca_file(tmp_path)
+        ok, deadline = b"+OK\r\n", time.time() + 30
+        while True:
+            try:
+                unauthenticated = _tls_session(ep, ca, ("SET", "k", "v"))[0]
+                break
+            except OSError:  # still starting
+                assert time.time() < deadline
+                time.sleep(0.5)
+        assert unauthenticated.startswith(b"-NOAUTH")
+        assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
+        took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
+        assert took[1].startswith(b"-NOPERM")
+
+        ec.modify_user(UserId=app, AccessString="on ~app:* +@read")  # re-applied with default off
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v"))[1].startswith(b"-NOPERM")
+        ec.modify_user_group(UserGroupId=group, UserIdsToRemove=[app])
+        assert _tls_session(ep, ca, ("AUTH", app, pw))[0].startswith(b"-WRONGPASS")
+        ec.modify_replication_group(ReplicationGroupId=rg_id, UserGroupIdsToRemove=[group], ApplyImmediately=True)
+        assert _tls_session(ep, ca, ("SET", "k", "v")) == [ok]
+    finally:
+        ec.delete_replication_group(ReplicationGroupId=rg_id)
+        ec.delete_user_group(UserGroupId=group)
+        ec.delete_user(UserId=app)
+
+
+def test_elasticache_acl_setuser_denies_inside_selectors_only():
+    """Restricted commands are denied inside each (selector), and a key pattern ending in `)` is no selector."""
+    from ministack.services import elasticache as _ec
+    user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
+    assert _ec._acl_setuser(user, ("-a", "-b")) == [
+        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+    assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
+
+
+def test_elasticache_user_group_acl_never_applies_the_internal_admin_name():
+    from ministack.services import elasticache as _ec
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    _ec._users[f"x-{uid}"] = {"UserId": f"x-{uid}", "UserName": _ec._ACL_ADMIN, "AccessString": "on ~* +@all"}
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"x-{uid}"]}
+    try:
+        assert _ec._user_group_acl_commands(get_account_id(), get_region(), [f"g-{uid}"]) == [
+            ["ACL", "SETUSER", "default", "reset"]]
+    finally:
+        del _ec._users[f"x-{uid}"], _ec._user_groups[f"g-{uid}"]
+
+
+def test_elasticache_user_group_apply_converges_on_changes_made_meanwhile(monkeypatch):
+    """A change that lands while the engine is being configured is applied too, without a lock."""
+    from ministack.services import elasticache as _ec
+    from ministack.core.responses import get_account_id, get_region
+    uid = _uid()
+    user = {"UserId": f"a-{uid}", "UserName": f"a-{uid}", "AccessString": "on ~* +@all",
+            "Authentication": {"Type": "iam"}}
+    _ec._users[user["UserId"]] = user
+    _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [user["UserId"]]}
+    applied, sent = [], []
+
+    class Container:
+        def exec_run(self, cmd):
+            command = cmd[cmd.index("-p") + 2:]
+            sent.append(command)
+            if command[:3] == ["ACL", "SETUSER", user["UserName"]]:
+                applied.append(command)
+                user["AccessString"] = "on ~app:* -@all +@read"  # a ModifyUser landing meanwhile
+            return types.SimpleNamespace(output=b"" if command[:2] == ["ACL", "USERS"] else b"OK")
+
+    client = types.SimpleNamespace(containers=types.SimpleNamespace(get=lambda cid: Container()))
+    monkeypatch.setattr(_ec, "_get_docker", lambda: client)
+    rg = {"ReplicationGroupId": f"rg-{uid}", "Engine": "valkey", "EngineVersion": "8.0",
+          "UserGroupIds": [f"g-{uid}"], "_docker_container_ids": ["c1"]}
+    try:
+        _ec._apply_user_groups(rg, get_account_id(), get_region())
+        assert "~app:*" in applied[-1] and "+@all" not in applied[-1]
+        assert sent[-2:] == [["CONFIG", "SET", "masteruser", _ec._ACL_ADMIN],
+                             ["CONFIG", "SET", "masterauth", rg["_acl_admin"]]]  # replicas, with default off
+    finally:
+        del _ec._users[user["UserId"]], _ec._user_groups[f"g-{uid}"]
