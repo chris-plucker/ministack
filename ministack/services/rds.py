@@ -126,42 +126,6 @@ _port_counter = [BASE_PORT]
 _docker = None
 _ministack_network = None
 _shared_container_lock = threading.RLock()
-# Cluster ARN -> DescribeDBClusters calls answered since a master password
-# change. Real AWS (captured, us-west-2): the change shows PendingModifiedValues
-# {MasterUserPassword: ****} on an available cluster, then status
-# resetting-master-credentials, then available with nothing pending. Kept out of
-# the cluster dicts so snapshots need no state lock; the tiny lock makes the
-# advance atomic against a concurrent ModifyDBCluster.
-_reset_pending = {}
-_reset_pending_lock = threading.Lock()
-
-
-def _reset_clear(arn=None):
-    with _reset_pending_lock:
-        if arn is None:
-            _reset_pending.clear()
-        else:
-            _reset_pending.pop(arn, None)
-
-
-def _reset_view(c, advance):
-    """Return *c* as AWS shows it during a master password reset."""
-    arn = c.get("DBClusterArn")
-    with _reset_pending_lock:
-        seen = _reset_pending.get(arn)
-        if seen is None:
-            return c
-        if advance:
-            if seen >= 2:
-                _reset_pending.pop(arn, None)
-            else:
-                _reset_pending[arn] = seen + 1
-    if advance and seen >= 2:
-        return c
-    view = {**c, "PendingModifiedValues": {"MasterUserPassword": "****"}}
-    if seen == 1 and advance and c.get("Status") == "available":
-        view["Status"] = "resetting-master-credentials"
-    return view
 _mysql_global_writer_switch_lock = threading.RLock()
 _mysql_global_writer_switch_owners = {}
 _mysql_global_instance_mutations = {}
@@ -6306,13 +6270,36 @@ def _delete_db_cluster(p):
             )
         _tags.pop(cluster["DBClusterArn"], None)
         del _clusters[cluster["DBClusterIdentifier"]]
-        _reset_clear(cluster.get("DBClusterArn"))
         master_user_secret = cluster.get("MasterUserSecret")
         if master_user_secret and master_user_secret.get("SecretArn"):
             # RDS deletes its managed master user secret with the cluster.
             secretsmanager.delete_secret_in_process(master_user_secret["SecretArn"])
     return _xml(200, "DeleteDBClusterResponse",
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
+
+
+def _password_reset_view(c, advance):
+    """Return *c* as AWS shows it during a master password reset.
+
+    Real AWS (captured, us-west-2): after the change, the ModifyDBCluster
+    response and the next DescribeDBClusters show an available cluster with
+    PendingModifiedValues {MasterUserPassword: ****}, the one after reports
+    resetting-master-credentials, and later ones available with nothing
+    pending. ``_password_reset_describes`` counts the describes answered;
+    once set it is only reassigned (3 = settled), so describe and stop never
+    change the cluster dict's size under a concurrent get_state() deepcopy.
+    """
+    seen = c.get("_password_reset_describes")
+    if seen is None or seen > 2:
+        return c
+    if advance:
+        c["_password_reset_describes"] = seen + 1
+        if seen == 2:
+            return c
+    view = {**c, "PendingModifiedValues": {"MasterUserPassword": "****"}}
+    if advance and seen == 1 and c.get("Status") == "available":
+        view["Status"] = "resetting-master-credentials"
+    return view
 
 
 def _describe_db_clusters(p):
@@ -6334,10 +6321,9 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = ""
-    for c in clusters:
-        members += f"<DBCluster>{_cluster_xml(_reset_view(c, True))}</DBCluster>"
-    members += docdb_members
+    members = "".join(
+        f"<DBCluster>{_cluster_xml(_password_reset_view(c, True))}</DBCluster>" for c in clusters
+    ) + docdb_members
     return _xml(200, "DescribeDBClustersResponse",
         f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
 
@@ -6553,8 +6539,7 @@ def _modify_db_cluster_impl(p):
             )
         _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
         if cluster.get("Status") == "available":
-            with _reset_pending_lock:
-                _reset_pending[cluster.get("DBClusterArn")] = 0
+            cluster["_password_reset_describes"] = 0
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
@@ -6631,7 +6616,7 @@ def _modify_db_cluster_impl(p):
                 _inherit_performance_insights(instance, cluster)
 
     return _xml(200, "ModifyDBClusterResponse",
-        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_reset_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_password_reset_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -7430,7 +7415,6 @@ def _start_db_cluster(p):
         return _xml(200, "StartDBClusterResponse",
             f"<StartDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></StartDBClusterResult>")
 
-    _reset_clear(cluster.get("DBClusterArn"))
     cluster["Status"] = "starting"
     for inst in member_instances:
         inst["DBInstanceStatus"] = "starting"
@@ -7647,7 +7631,8 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
-    _reset_clear(cluster.get("DBClusterArn"))
+    if "_password_reset_describes" in cluster:
+        cluster["_password_reset_describes"] = 3  # settled; reassigned, not popped (see _password_reset_view)
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
@@ -11657,7 +11642,6 @@ def reset():
     # restore worker can pass its membership check after reset has enumerated
     # resources, then create a container after the stores are cleared.
     with _shared_container_lock:
-        _reset_clear()
         _mysql_global_writer_switch_owners.clear()
         _mysql_global_instance_mutations.clear()
         docker_client = _get_docker()
