@@ -2603,6 +2603,8 @@ def test_elasticache_replication_group_user_groups_reach_the_engine(ec, tmp_path
         assert unauthenticated.startswith(b"-NOAUTH")
         assert _tls_session(ep, ca, ("AUTH", app, "wrong-password-123456"))[0].startswith(b"-WRONGPASS")
         assert _tls_session(ep, ca, ("AUTH", app, pw), ("SET", "k", "v")) == [ok, ok]
+        # All channels, as on AWS, for an access string without channel rules.
+        assert _tls_session(ep, ca, ("AUTH", app, pw), ("PUBLISH", "ch", "x")) == [ok, b":0\r\n"]
         took = _tls_session(ep, ca, ("AUTH", app, pw), ("ACL", "SETUSER", "default", "on", "nopass", "+@all"))
         assert took[1].startswith(b"-NOPERM")
 
@@ -2623,7 +2625,7 @@ def test_elasticache_acl_setuser_denies_inside_selectors_only():
     from ministack.services import elasticache as _ec
     user = {"UserName": "u", "AccessString": "on ~foo) (~x +get) +set", "Authentication": {"Type": "iam"}}
     assert _ec._acl_setuser(user, ("-a", "-b")) == [
-        "ACL", "SETUSER", "u", "reset", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
+        "ACL", "SETUSER", "u", "reset", "&*", "on", "~foo)", "(~x", "+get", "-a", "-b)", "+set", "-a", "-b", "nopass"]
     assert _ec._reported_access_string("on ~* (+get +set ~*)") == "on ~* -@all (+get +set ~*)"
 
 
@@ -2635,7 +2637,7 @@ def test_elasticache_user_group_acl_never_applies_the_internal_admin_name():
     _ec._user_groups[f"g-{uid}"] = {"UserGroupId": f"g-{uid}", "UserIds": [f"x-{uid}"]}
     try:
         assert _ec._user_group_acl_commands(get_account_id(), get_region(), [f"g-{uid}"]) == [
-            ["ACL", "SETUSER", "default", "reset"]]
+            ["ACL", "SETUSER", "default", "reset", "&*"]]
     finally:
         del _ec._users[f"x-{uid}"], _ec._user_groups[f"g-{uid}"]
 

@@ -2440,8 +2440,13 @@ def _spawn_serverless_container(name, engine, full_version, host_port, labels, w
 def _acl_setuser(user, deny=()):
     """ACL SETUSER for an ElastiCache user: its access string, then its passwords (stored hashed).
     An iam user's token is not checked, as with AUTH=false elsewhere."""
+    tokens = user.get("AccessString", "").split()
+    # A string without channel rules gets all channels (real AWS, us-west-2: "on ~* +@all" is
+    # "user app on ... ~* &* +@all" on the engine); reset alone would leave none.
     rules, in_selector = ["reset"], False
-    for token in user.get("AccessString", "").split():  # each (selector) grants on its own: deny there too
+    if not any(t.startswith(("&", "(&")) or t.lower() in ("allchannels", "resetchannels") for t in tokens):
+        rules.append("&*")
+    for token in tokens:  # each (selector) grants on its own: deny there too
         in_selector = in_selector or token.startswith("(")
         if deny and in_selector and token.endswith(")"):
             rules += [token[:-1], *deny[:-1], deny[-1] + ")"]
@@ -2467,7 +2472,7 @@ def _user_group_acl_commands(account_id, region, group_ids, deny=()):
              if u and u.get("UserName") != "_ministack-admin"]
     default = next((u for u in users if u.get("UserName") == "default"), None)
     commands = [_acl_setuser(u, deny) for u in users if u.get("UserName") != "default"]
-    commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset"])
+    commands.append(_acl_setuser(default, deny) if default else ["ACL", "SETUSER", "default", "reset", "&*"])
     return commands
 
 
