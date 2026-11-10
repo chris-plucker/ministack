@@ -28,8 +28,10 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("secretsmanager")
@@ -47,6 +49,19 @@ _resource_policies = AccountRegionScopedDict()
 #   ReplicationStatus: [{Region, Status, StatusMessage}],
 #   Versions: { version_id: {SecretString, SecretBinary, CreatedDate, Stages: [str]} }
 # }
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null."""
+    if isinstance(value, dict):
+        return {k: _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 # ── Persistence ────────────────────────────────────────────
@@ -111,13 +126,16 @@ def _secret_arn_for_region(secret, region):
     return f"arn:{spec.partition}:secretsmanager:{region}:{spec.account_id}:{spec.resource}"
 
 
-def _resolve(secret_id, *, use_arn_scope=False):
+def _resolve(secret_id, *, use_arn_scope=False, cross_account=False):
     """Look up a secret by name or ARN.  Returns (storage_key, record) or (None, None).
 
     Supports three lookup modes (matching real AWS behaviour):
       1. By name:        "my-secret"
       2. By full ARN:    "arn:aws:secretsmanager:...:secret:my-secret-A1B2C3"
       3. By partial ARN: "arn:aws:secretsmanager:...:secret:my-secret" (no random suffix)
+
+    ``use_arn_scope`` searches the region in the ARN. ``cross_account`` also
+    lets the ARN name another account.
     """
     if not secret_id:
         return None, None
@@ -126,7 +144,7 @@ def _resolve(secret_id, *, use_arn_scope=False):
         if not scope:
             return None, None
         spec, _ = scope
-        if spec.account_id != get_account_id():
+        if spec.account_id != get_account_id() and not cross_account:
             return None, None
         if use_arn_scope:
             candidates = _secrets.items_scoped(spec.account_id, spec.region)
@@ -164,16 +182,17 @@ def _find_stage_version(secret, stage):
     return None, None
 
 
-def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None):
+def resolve_secret_string(secret_id, version_stage="AWSCURRENT", version_id=None, cross_account=False):
     """Return the SecretString for *secret_id* at *version_stage* (or the
     version *version_id*), or None.
 
     Used by other services (e.g. ECS, CloudFormation dynamic references) that
     need to read a secret value in-process without going through the HTTP API.
+    With *cross_account*, an ARN is read in the account it names.
     Returns None if the secret does not exist, is scheduled for deletion, or
     has no value for the stage / version.
     """
-    _, secret = _resolve(secret_id, use_arn_scope=True)
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=cross_account)
     if not secret or secret.get("DeletedDate"):
         return None
     if version_id:
@@ -502,14 +521,41 @@ def _add_stage(secret, version_id, stage):
 # Router
 # ---------------------------------------------------------------------------
 
+def _parse_request_body(body):
+    """The request must be one JSON object. Anything else is a SerializationException (captured for every
+    action): a top-level list names itself, and the rest carry no message at all."""
+    def refusal(message=None):
+        data = {"__type": "SerializationException"}
+        if message:
+            data["Message"] = message
+        # AWS sends this one as json 1.1 with no x-amzn-errortype header.
+        return None, (400, {"Content-Type": "application/x-amz-json-1.1"}, json.dumps(data).encode("utf-8"))
+
+    raw = body if isinstance(body, bytes) else (body or "").encode("utf-8")
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return refusal()
+    def reject_constant(name):
+        raise ValueError(name)  # NaN and Infinity are not JSON
+
+    try:
+        # A stray invalid byte inside a string is accepted by AWS, so it is replaced rather than refused.
+        data = json.loads(raw.decode("utf-8", errors="replace"), parse_constant=reject_constant)
+    except ValueError:
+        return refusal()
+    if isinstance(data, list):
+        return refusal("Start of list found where not expected")
+    if not isinstance(data, dict):
+        return refusal()
+    return data, None
+
+
 async def handle_request(method, path, headers, body, query_params):
     target = headers.get("x-amz-target", "")
     action = target.split(".")[-1] if "." in target else ""
 
-    try:
-        data = json.loads(body) if body else {}
-    except json.JSONDecodeError:
-        return error_response_json("SerializationException", "Invalid JSON", 400)
+    data, error = _parse_request_body(body)
+    if error:
+        return error
 
     handlers = {
         "CreateSecret": _create_secret,
@@ -528,6 +574,8 @@ async def handle_request(method, path, headers, body, query_params):
         "RotateSecret": _rotate_secret,
         "GetRandomPassword": _get_random_password,
         "ReplicateSecretToRegions": _replicate_secret_to_regions,
+        "RemoveRegionsFromReplication": _remove_regions_from_replication,
+        "StopReplicationToReplica": _stop_replication_to_replica,
         "PutResourcePolicy": _put_resource_policy,
         "GetResourcePolicy": _get_resource_policy,
         "DeleteResourcePolicy": _delete_resource_policy,
@@ -607,7 +655,18 @@ def _create_secret(data):
         rotation_lambda_arn=data.get("RotationLambdaARN"),
         rotation_rules=data.get("RotationRules"),
     )
-    return json_response({"ARN": arn, "Name": name, "VersionId": vid})
+    result = {"ARN": arn, "Name": name, "VersionId": vid}
+    if data.get("AddReplicaRegions"):
+        replicated = _replicate_secret_to_regions({
+            "SecretId": arn,
+            "AddReplicaRegions": data["AddReplicaRegions"],
+            "ForceOverwriteReplicaSecret": data.get("ForceOverwriteReplicaSecret", False),
+        })
+        if replicated[0] != 200:
+            _secrets.pop(name, None)
+            return replicated
+        result["ReplicationStatus"] = _secrets[name]["ReplicationStatus"]
+    return json_response(result)
 
 
 def _get_secret_value(data):
@@ -759,8 +818,8 @@ def _list_secrets(data):
         }
         if s.get("DeletedDate"):
             entry["DeletedDate"] = s["DeletedDate"]
-        if s.get("_PrimaryRegion"):
-            entry["PrimaryRegion"] = s["_PrimaryRegion"]
+        if _primary_region(s):
+            entry["PrimaryRegion"] = _primary_region(s)
         secret_list.append(entry)
 
     resp: dict = {"SecretList": secret_list}
@@ -808,8 +867,6 @@ def _delete_secret(data):
             "InvalidRequestException",
             "You can't perform this operation on the secret because it was already scheduled for deletion.", 400,
         )
-    if _is_replica(secret):
-        return _replica_mutation_error()
 
     if force and window is not None:
         return error_response_json(
@@ -822,6 +879,24 @@ def _delete_secret(data):
         return error_response_json(
             "InvalidParameterException",
             "RecoveryWindowInDays value must be between 7 and 30 days (inclusive).", 400,
+        )
+    # AWS checks these after the request itself is valid, for a forced delete as well.
+    if _is_replica(secret):
+        return error_response_json(
+            "InvalidParameterException",
+            "Operation not permitted on a replica secret. Call must be made in primary secret's region.", 400,
+        )
+    source_scope = _secret_scope_from_arn(secret["ARN"])
+    source_region = source_scope[0].region if source_scope else get_region()
+    replica_regions = sorted(
+        status["Region"] for status in secret.get("ReplicationStatus", [])
+        if status.get("Region") and status["Region"] != source_region
+    )
+    if replica_regions:
+        return error_response_json(
+            "InvalidParameterException",
+            f"You can't delete secret {secret['ARN']} that still has replica regions [{', '.join(replica_regions)}].",
+            400,
         )
 
     now = int(time.time())
@@ -896,6 +971,18 @@ def _update_secret(data):
     return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "VersionId": vid})
 
 
+def _primary_region(secret):
+    """The Region AWS reports as a secret's PrimaryRegion: a replica's source Region, the secret's own
+    Region when it has replicas, and nothing for a secret that is not replicated."""
+    if secret.get("_PrimaryRegion"):
+        return secret["_PrimaryRegion"]
+    region = secret["ARN"].split(":")[3]
+    # Only replicas elsewhere count: a legacy status naming the secret's own Region is not a replica.
+    if any(r.get("Region") != region for r in secret.get("ReplicationStatus") or []):
+        return region
+    return None
+
+
 def _describe_secret(data):
     secret_id = data.get("SecretId")
     _, secret = _resolve(secret_id)
@@ -918,8 +1005,8 @@ def _describe_secret(data):
     }
     if secret.get("DeletedDate"):
         result["DeletedDate"] = secret["DeletedDate"]
-    if secret.get("_PrimaryRegion"):
-        result["PrimaryRegion"] = secret["_PrimaryRegion"]
+    if _primary_region(secret):
+        result["PrimaryRegion"] = _primary_region(secret)
     if secret.get("KmsKeyId"):
         result["KmsKeyId"] = secret["KmsKeyId"]
     if secret.get("RotationLambdaARN"):
@@ -1355,6 +1442,184 @@ def _replicate_secret_to_regions(data):
     })
 
 
+# Regions AWS accepted as replica regions in real captures (the aws partition; gov, iso and unlaunched
+# names such as us-east-3 were refused). A region that already holds a replica is also accepted, because
+# ReplicateSecretToRegions in MiniStack takes any name.
+_REPLICA_REGIONS = frozenset({
+    "us-east-1", "us-east-2", "us-northeast-1", "us-west-1", "us-west-2", "af-south-1", "ap-east-1", "ap-east-2",
+    "ap-south-1", "ap-south-2", "ap-northeast-1", "ap-northeast-2", "ap-northeast-3",
+    "ap-southeast-1", "ap-southeast-2", "ap-southeast-3", "ap-southeast-4", "ap-southeast-5",
+    "ap-southeast-6", "ap-southeast-7", "ca-central-1", "ca-west-1", "eu-central-1", "eu-central-2",
+    "eu-west-1", "eu-west-2", "eu-west-3", "eu-north-1", "eu-south-1", "eu-south-2",
+    "il-central-1", "me-south-1", "me-central-1", "me-west-1", "sa-east-1", "sa-west-1", "mx-central-1",
+})
+_REGION_PATTERN = re.compile(r"([a-z]+-)+[0-9]+")
+_SECRET_NAME_PATTERN = re.compile(r"[A-Za-z0-9/_+=.@!-]{1,512}")
+_REGION_CONSTRAINT = (
+    "Member must satisfy constraint: [Member must have length less than or equal to 128, "
+    "Member must have length greater than or equal to 1, "
+    "Member must satisfy regular expression pattern: ^([a-z]+-)+\\d+$]"
+)
+
+
+def _bean_value(items):
+    text = "[" + ", ".join(str(i) for i in items) + "]"
+    return f"'{text[:64]} ...'" if len(text) > 64 else f"'{text}'"
+
+
+def _wire_type_error(secret_id, regions=None):
+    """The JSON parser's refusal of a value that is not a string, checked before anything else.
+    RemoveReplicaRegions (a list of strings) is read before SecretId, whatever the key order."""
+    def refusal(item):
+        if item is None or isinstance(item, str):
+            return None
+        if item is True or item is False:
+            return f"{'TRUE' if item else 'FALSE'}_VALUE can not be converted to a String"
+        if isinstance(item, (int, float)):
+            return "NUMBER_VALUE can not be converted to a String"
+        if isinstance(item, list):
+            return "Start of list found where not expected"
+        return "Start of structure or map found where not expected."
+
+    message = None
+    if isinstance(regions, list):
+        message = next(filter(None, map(refusal, regions)), None)
+    elif regions is not None:
+        message = "Start of structure or map found where not expected." if isinstance(regions, dict) \
+            else "Expected list or null"
+    message = message or refusal(secret_id)
+    if message:
+        return error_response_json("SerializationException", message, 400, message_key="Message")
+    return None
+
+
+def _secret_id_error(secret_id):
+    """SecretId checks AWS runs on SecretId before the model checks (captured order)."""
+    if len(secret_id) > 1024:
+        return error_response_json("InvalidParameterException", "SecretId exceeds size limit.", 400)
+    if secret_id.startswith("arn:"):
+        # Any partition passes; anything that is not a Secrets Manager secret ARN is an invalid name.
+        parts = secret_id.split(":", 5)
+        if len(parts) == 6 and parts[2] == "secretsmanager" and len(parts[5]) > len("secret:") \
+                and parts[5].startswith("secret:"):
+            return None
+    elif _SECRET_NAME_PATTERN.fullmatch(secret_id):
+        return None
+    return error_response_json(
+        "ValidationException",
+        "Invalid name. Must be a valid name containing alphanumeric characters, or any of the following: -/_+=.@!",
+        400,
+    )
+
+
+def _request_validation_error(secret_id, regions=(), check_regions=False):
+    """The model-level ValidationException: every failed member is reported in one error."""
+    errors = []
+    if check_regions:
+        if regions is None:
+            errors.append("Value null at 'removeReplicaRegions' failed to satisfy constraint: Member must not be null")
+        elif not regions:
+            errors.append(
+                "Value '[]' at 'removeReplicaRegions' failed to satisfy constraint: "
+                "Member must have length greater than or equal to 1"
+            )
+        elif any(isinstance(r, str) and not (len(r) <= 128 and _REGION_PATTERN.fullmatch(r)) for r in regions):
+            errors.append(
+                f"Value {_bean_value(regions)} at 'removeReplicaRegions' failed to satisfy constraint: "
+                + _REGION_CONSTRAINT
+            )
+    if secret_id is None:
+        errors.append("Value null at 'secretId' failed to satisfy constraint: Member must not be null")
+    if not errors:
+        return None
+    noun = "error" if len(errors) == 1 else "errors"
+    return error_response_json(
+        "ValidationException", f"{len(errors)} validation {noun} detected: " + "; ".join(errors), 400,
+    )
+
+
+def _remove_regions_from_replication(data):
+    secret_id = data.get("SecretId")
+    regions = data.get("RemoveReplicaRegions")
+    error = _wire_type_error(secret_id, regions)
+    if error:
+        return error
+    if secret_id is not None:
+        error = _secret_id_error(secret_id)
+        if error:
+            return error
+    error = _request_validation_error(secret_id, regions, check_regions=True)
+    if error:
+        return error
+    _, secret = _resolve(secret_id)
+    if not secret:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "Secrets Manager can't find the specified secret.", 400,
+        )
+    if _is_replica(secret):
+        return error_response_json(
+            "InvalidParameterException",
+            "Operation not permitted on a replica secret. Call must be made in primary secret's region.", 400,
+        )
+    source_scope = _secret_scope_from_arn(secret["ARN"])
+    account_id = source_scope[0].account_id if source_scope else get_account_id()
+    source_region = source_scope[0].region if source_scope else get_region()
+    # AWS validates the whole request first: one bad region fails it with nothing removed.
+    replicated = {status.get("Region") for status in secret.get("ReplicationStatus", [])}
+    for region in regions:
+        if region == source_region or region not in _REPLICA_REGIONS | replicated:
+            return error_response_json("InvalidParameterException", "Invalid replica region.", 400)
+
+    # Only a region still replicating is taken down; a replica that was stopped is a secret of its own.
+    for region in set(regions) & replicated:
+        replica = _secrets.get_scoped(account_id, region, secret["Name"])
+        if (replica and replica.get("ARN") == _secret_arn_for_region(secret, region)
+                and replica.get("_PrimarySecretArn") == secret["ARN"]):
+            _resource_policies.pop_scoped(account_id, region, replica["ARN"], None)
+            _secrets.pop_scoped(account_id, region, secret["Name"], None)
+    # A region that was never a replica is a no-op in AWS, so only drop the statuses that are listed.
+    secret["ReplicationStatus"] = [
+        status for status in secret.get("ReplicationStatus", [])
+        if status.get("Region") not in regions
+    ]
+    # Every successful call moves the primary's LastChangedDate, even one that removes nothing.
+    secret["LastChangedDate"] = int(time.time())
+    return json_response({"ARN": secret["ARN"], "ReplicationStatus": secret["ReplicationStatus"]})
+
+
+def _stop_replication_to_replica(data):
+    secret_id = data.get("SecretId")
+    error = _wire_type_error(secret_id)
+    if error:
+        return error
+    if secret_id is not None:
+        error = _secret_id_error(secret_id)
+        if error:
+            return error
+    error = _request_validation_error(secret_id)
+    if error:
+        return error
+    _, secret = _resolve(secret_id)
+    if not secret:
+        return error_response_json(
+            "ResourceNotFoundException",
+            "Secrets Manager can't find the specified secret.", 400,
+        )
+    if not _is_replica(secret):
+        if secret.get("ReplicationStatus"):
+            message = "Operation not permitted on a primary secret. Call must be made in replica secret's region."
+        else:
+            message = "Operation not permitted on a primary/standalone secret."
+        return error_response_json("InvalidParameterException", message, 400)
+
+    _unlink_from_primary(secret)
+    secret.pop("_PrimarySecretArn", None)
+    secret.pop("_PrimaryRegion", None)
+    secret["LastChangedDate"] = int(time.time())
+    return json_response({"ARN": secret["ARN"]})
+
+
 # ---------------------------------------------------------------------------
 # Resource policies
 # ---------------------------------------------------------------------------
@@ -1365,6 +1630,42 @@ def secret_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     if not secret or secret["ARN"] != resource_arn:
         return None
     return _resource_policies.get(resource_arn) or "", get_account_id()
+
+
+def foreign_secret_readable(secret_id: str) -> bool:
+    """Under AUTH=true, whether the caller may read a secret another account owns: an explicit Allow in its
+    resource policy, the caller's own GetSecretValue and kms:Decrypt, and a customer managed key whose policy
+    allows the caller, since the AWS managed key cannot be used across accounts (Secrets Manager guide)."""
+    from ministack.app import AUTH
+    from ministack.core.iam_evaluator import EvalContext, _verified_key, caller_arn, enforce, resource_policy_allows
+    from ministack.services import kms
+    if not AUTH:
+        return True
+    _, secret = _resolve(secret_id, use_arn_scope=True, cross_account=True)
+    if not secret:
+        return True  # not found is reported by the caller
+    spec, _ = _secret_scope_from_arn(secret["ARN"])
+    if spec.account_id == get_account_id():
+        return True
+    caller = caller_arn()
+    ctx = EvalContext(principal_arn=caller, principal_account=caller.split(":")[4],
+                      principal_type="Root" if caller.endswith(":root") else
+                      "AssumedRole" if ":assumed-role/" in caller else "User",
+                      action="secretsmanager:GetSecretValue", resource_arn=secret["ARN"], region=spec.region)
+    policy = _resource_policies.get_scoped(spec.account_id, spec.region, secret["ARN"])
+    if not resource_policy_allows(policy, ctx, same_account=False):
+        return False
+    kms_key = secret.get("KmsKeyId") or ""
+    if not kms_key or kms_key.endswith("alias/aws/secretsmanager"):
+        return False
+    if not kms_key.startswith("arn:"):
+        kms_key = f"arn:aws:kms:{spec.region}:{spec.account_id}:{'' if kms_key.startswith('alias/') else 'key/'}{kms_key}"
+    _owner, key = kms._foreign_key(kms_key)
+    if not key or not kms.key_policy_allows_caller(key, "Decrypt", caller):
+        return False
+    identity = _verified_key.get()
+    return (enforce(identity, "secretsmanager:GetSecretValue", "secretsmanager", spec.region, secret["ARN"]) is None
+            and enforce(identity, "kms:Decrypt", "kms", spec.region, kms_key) is None)
 
 
 def _put_resource_policy(data):

@@ -436,18 +436,50 @@ def s3_additional_checks(method: str, path: str, headers: dict, body: bytes,
     return checks
 
 
-def s3_access_point_resources(resource_arn: str) -> list[tuple[str, dict]]:
-    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias."""
+# The context key marking the checks of a PutObject through another account's access point.
+S3_FOREIGN_STEP = "ministack:s3foreignstep"
+
+
+def s3_access_point_resources(resource_arn: str, action: str = "") -> list[tuple[str, dict]]:
+    """``(resource ARN, condition keys)`` an S3 check is made on, the access point and its bucket for an alias.
+
+    A ``s3:PutObject`` through another account's access point is checked in the order recorded on AWS
+    (us-east-2): the caller's identity policy on the bucket object, then the owner's bucket policy, then the
+    caller's identity policy on the access point object, then the access point policy (with neither resource
+    policy allowing, the bucket answers; the identity policy must allow both objects). ``S3_FOREIGN_STEP``
+    names the step of each check.
+    """
+    from ministack.core.responses import get_account_id
     from ministack.services import s3 as s3_svc
 
     alias, sep, key = resource_arn.removeprefix("arn:aws:s3:::").partition("/")
-    access_point = s3_svc.access_point_for_alias(alias) if resource_arn.startswith("arn:aws:s3:::") else None
+    foreign = action == "s3:PutObject" and bool(sep)
+    access_point = s3_svc.access_point_for_alias(alias, foreign) if resource_arn.startswith("arn:aws:s3:::") else None
     if access_point is None:
         return [(resource_arn, {})]
     access_point_arn, bucket, keys = access_point
     if sep:
-        return [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+        checks = [(f"{access_point_arn}/object/{key}", keys), (f"arn:aws:s3:::{bucket}/{key}", keys)]
+        if keys["s3:DataAccessPointAccount"] != get_account_id():
+            checks = [(checks[1][0], {**keys, S3_FOREIGN_STEP: "identity"}),
+                      (checks[1][0], {**keys, S3_FOREIGN_STEP: "bucket"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint-identity"}),
+                      (checks[0][0], {**keys, S3_FOREIGN_STEP: "accesspoint"})]
+        return checks
     return [(access_point_arn, keys), (f"arn:aws:s3:::{bucket}", keys)]
+
+
+def s3_foreign_denial_message(keys: dict, action: str, principal_arn: str, denied, resource: str) -> str:
+    """The message of a denial in a step of a PutObject through another account's access point, or "" for
+    any other check (and for an explicit Deny of a resource policy, which has its own wording)."""
+    step = keys.get(S3_FOREIGN_STEP)
+    explicit = denied.decision == "Deny"
+    if not step or (explicit and denied.resource_policy_arn):
+        return ""
+    if explicit or step in ("identity", "accesspoint-identity"):
+        return identity_denial_message(action, principal_arn, f'"{resource}"', explicit)
+    return (f'User: {principal_arn} is not authorized to perform: {action} on resource: "{resource}" '
+            f"because no resource-based policy allows the {action} action")
 
 
 # Lambda REST path → IAM action
@@ -1168,6 +1200,11 @@ def extract_resource_arn(service: str, method: str, path: str,
             # keys — the key is recovered from the ciphertext.
             key_id = _kms_key_id_from_ciphertext(
                 _safe_json_field(body, "CiphertextBlob"))
+            if key_id:
+                # The ciphertext names its key by id; it may belong to another account.
+                from ministack.services.kms import ciphertext_key_arn
+
+                return ciphertext_key_arn(key_id)
         if key_id:
             # KeyId can be an ARN, alias, or key ID
             if key_id.startswith("arn:"):
@@ -1406,6 +1443,13 @@ def extract_resource_arn(service: str, method: str, path: str,
         return "*"
 
     if service == "cloudformation":
+        set_name = _query_param(query_params, "StackSetName")
+        if set_name and _query_param(query_params, "Action") in ("DescribeStackSet", "ListStackInstances"):
+            # A StackSet's ARN ends in its StackSetId, whether named by name or by ID.
+            from ministack.services.cloudformation import _stack_sets
+            rec = next((r for r in _stack_sets.values_scoped(account_id, region) if r["StackSetId"] == set_name
+                        or (r["StackSetName"] == set_name and r["Status"] == "ACTIVE")), None)
+            return f"arn:aws:cloudformation:{region}:{account_id}:stackset/{rec['StackSetId'] if rec else set_name}"
         name = _query_param(query_params, "StackName")
         if name:
             if name.startswith("arn:"):
@@ -2055,12 +2099,22 @@ def dynamodb_transaction_checks(
 
 def s3_service_context(iam_action: str, query_params: dict | None, path: str = "",
                        headers: dict | None = None) -> dict:
-    """The S3 condition keys a request carries: listing keys, a write's encryption and ACL, a read's object tags."""
+    """The S3 condition keys a request carries: its signature on every action, listing keys, a
+    write's encryption, ACL, storage, copy, lock and tag headers, a read's object tags and version."""
+    query_params, headers = query_params or {}, headers or {}
+    context = _s3_request_context(query_params, headers)
     if iam_action in ("s3:PutObject", "s3:GetObject", "s3:GetObjectVersion"):
-        return _s3_object_context(iam_action, query_params or {}, path, headers or {})
+        return {**context, **_s3_object_context(iam_action, query_params, path, headers)}
+    if iam_action in ("s3:CreateBucket", "s3:PutObjectAcl", "s3:PutObjectVersionAcl", "s3:PutBucketAcl"):
+        context.update(_s3_header_keys(headers, _S3_ACL_HEADERS))
+        if iam_action == "s3:CreateBucket":
+            context.update(_s3_header_keys(headers, ("x-amz-object-ownership",)))
+    if iam_action.endswith("Version") or iam_action.endswith("VersionAcl") or iam_action.endswith("VersionTagging"):
+        version_id = _query_param(query_params, "versionId")
+        if version_id:
+            context["s3:versionid"] = version_id
     if iam_action not in ("s3:ListBucket", "s3:ListBucketVersions"):
-        return {}
-    context = {}
+        return context
     for param in ("prefix", "delimiter", "max-keys"):
         value = (query_params or {}).get(param)
         if isinstance(value, list):
@@ -2070,8 +2124,56 @@ def s3_service_context(iam_action: str, query_params: dict | None, path: str = "
     return context
 
 
+_S3_ACL_HEADERS = ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
+                   "x-amz-grant-write-acp", "x-amz-grant-full-control")
+# Write headers whose condition key holds the header's value: s3:<header name>.
+_S3_WRITE_HEADERS = ("x-amz-storage-class", "x-amz-copy-source", "x-amz-metadata-directive",
+                     "x-amz-website-redirect-location", "x-amz-server-side-encryption-customer-algorithm")
+_S3_LOCK_HEADERS = {"x-amz-object-lock-mode": "s3:object-lock-mode",
+                    "x-amz-object-lock-retain-until-date": "s3:object-lock-retain-until-date",
+                    "x-amz-object-lock-legal-hold": "s3:object-lock-legal-hold"}
+
+
+def _s3_header_keys(headers: dict, names) -> dict:
+    return {f"s3:{name}": headers[name] for name in names if headers.get(name)}
+
+
+def _s3_request_context(query_params: dict, headers: dict) -> dict:
+    """The keys every authenticated S3 request carries (AWS's SigV4 policy keys): s3:authType REST-HEADER or
+    REST-QUERY-STRING, s3:signatureversion AWS4-HMAC-SHA256 (AWS for Signature Version 2), s3:signatureAge in
+    milliseconds and s3:x-amz-content-sha256 as sent. s3:ResourceAccount is resolved by the evaluator."""
+    import time as _time
+    from datetime import datetime, timezone
+
+    context: dict = {}
+    authorization = headers.get("authorization", "")
+    if authorization.startswith("AWS4-HMAC-SHA256"):
+        context.update({"s3:authType": "REST-HEADER", "s3:signatureversion": "AWS4-HMAC-SHA256"})
+        signed_at = headers.get("x-amz-date", "")
+    elif authorization.startswith("AWS "):
+        context.update({"s3:authType": "REST-HEADER", "s3:signatureversion": "AWS"})
+        signed_at = ""
+    elif _query_param(query_params, "X-Amz-Algorithm") == "AWS4-HMAC-SHA256":
+        context.update({"s3:authType": "REST-QUERY-STRING", "s3:signatureversion": "AWS4-HMAC-SHA256"})
+        signed_at = _query_param(query_params, "X-Amz-Date")
+    elif _query_param(query_params, "AWSAccessKeyId") and _query_param(query_params, "Signature"):
+        context.update({"s3:authType": "REST-QUERY-STRING", "s3:signatureversion": "AWS"})
+        signed_at = ""
+    else:
+        signed_at = ""
+    if signed_at:
+        try:
+            when = datetime.strptime(signed_at, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).timestamp()
+            context["s3:signatureAge"] = str(max(int((_time.time() - when) * 1000), 0))
+        except ValueError:
+            pass
+    if headers.get("x-amz-content-sha256"):
+        context["s3:x-amz-content-sha256"] = headers["x-amz-content-sha256"]
+    return context
+
+
 def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: dict) -> dict:
-    """s3:x-amz-server-side-encryption, s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
+    """s3:x-amz-server-side-encryption(-aws-kms-key-id), s3:x-amz-acl and s3:x-amz-grant-* of a write, s3:ExistingObjectTag of a read."""
     from ministack.services import s3 as s3_svc
 
     bucket, _, key = path.lstrip("/").partition("/")
@@ -2081,17 +2183,30 @@ def _s3_object_context(iam_action: str, query_params: dict, path: str, headers: 
     if iam_action == "s3:PutObject":
         # A part and the completion carry no headers: the upload's own request decides.
         upload_id = _query_param(query_params, "uploadId")
-        sse = s3_svc.upload_encryption_header(upload_id) if upload_id else headers.get("x-amz-server-side-encryption")
+        sse = (s3_svc.upload_encryption_header(upload_id, bucket) if upload_id
+               else headers.get("x-amz-server-side-encryption"))
         if sse:
             context["s3:x-amz-server-side-encryption"] = sse
+        kms_key = s3_svc.kms_key_for_condition(bucket, headers, upload_id)
+        if kms_key:
+            context["s3:x-amz-server-side-encryption-aws-kms-key-id"] = kms_key
         if not upload_id:
-            for name in ("x-amz-acl", "x-amz-grant-read", "x-amz-grant-write", "x-amz-grant-read-acp",
-                         "x-amz-grant-write-acp", "x-amz-grant-full-control"):
-                if headers.get(name):
-                    context[f"s3:{name}"] = headers[name]
+            context.update(_s3_header_keys(headers, _S3_ACL_HEADERS + _S3_WRITE_HEADERS))
+            context.update({key: headers[name] for name, key in _S3_LOCK_HEADERS.items() if headers.get(name)})
+            tags = {}
+            for pair in (headers.get("x-amz-tagging") or "").split("&"):
+                if pair:
+                    name, _, value = pair.partition("=")
+                    tags[unquote(name.replace("+", " "))] = unquote(value.replace("+", " "))
+            if tags:
+                context.update({f"s3:RequestObjectTag/{name}": value for name, value in tags.items()})
+                context["s3:RequestObjectTagKeys"] = list(tags)
     else:
         for name, value in s3_svc.object_tags_for_condition(bucket, key, query_params).items():
             context[f"s3:ExistingObjectTag/{name}"] = value
+        version_id = _query_param(query_params, "versionId")
+        if iam_action == "s3:GetObjectVersion" and version_id:
+            context["s3:versionid"] = version_id
     return context
 
 
@@ -2174,6 +2289,87 @@ def unsigned_operations(service: str) -> frozenset[str]:
             for op_name, op in _load_botocore_model(name).get("operations", {}).items()
             if op.get("authtype") == "none" or op.get("auth") == ["smithy.api#noAuth"])
     return _UNSIGNED_OPERATIONS[service]
+
+
+# Request-field condition keys, on the actions AWS's service reference lists them for.
+_KMS_CONTEXT_ACTIONS = {"CreateGrant", "Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair",
+                        "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext", "RetireGrant"}
+_KMS_ALGORITHM_ACTIONS = {"Decrypt", "Encrypt", "GenerateDataKey", "GenerateDataKeyPair",
+                          "GenerateDataKeyPairWithoutPlaintext", "GenerateDataKeyWithoutPlaintext"}
+_IAM_BOUNDARY_REQUEST_ACTIONS = {"CreateRole", "CreateUser", "PutRolePermissionsBoundary",
+                                 "PutUserPermissionsBoundary"}
+_IAM_BOUNDARY_TARGET_ACTIONS = {"AttachRolePolicy", "AttachUserPolicy", "DeleteRole", "DeleteRolePermissionsBoundary",
+                                "DeleteRolePolicy", "DeleteUserPermissionsBoundary", "DeleteUserPolicy",
+                                "DetachRolePolicy", "DetachUserPolicy", "GetRole", "PutRolePolicy", "PutUserPolicy",
+                                "UpdateAssumeRolePolicy", "UpdateRole", "UpdateRoleDescription"}
+_SECRET_ID_ACTIONS = {"CancelRotateSecret", "DeleteResourcePolicy", "DeleteSecret", "DescribeSecret",
+                      "GetResourcePolicy", "GetSecretValue", "ListSecretVersionIds", "PutResourcePolicy",
+                      "PutSecretValue", "RemoveRegionsFromReplication", "ReplicateSecretToRegions", "RestoreSecret",
+                      "RotateSecret", "StopReplicationToReplica", "TagResource", "UntagResource", "UpdateSecret",
+                      "UpdateSecretVersionStage", "ValidateResourcePolicy"}
+
+
+def request_field_context(service: str, iam_action: str, body: bytes, params: dict, region: str) -> dict:
+    """Condition keys that hold a request field as sent (kms:EncryptionContext, secretsmanager:SecretId,
+    sns:Protocol and the like), kms:CallerAccount, ec2:Region, and iam:PermissionsBoundary of the request or
+    of the role or user it names."""
+    from ministack.core.responses import get_account_id
+
+    action = iam_action.split(":", 1)[-1]
+    try:
+        data = json.loads(body) if (body or b"")[:1] == b"{" else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    context: dict = {}
+    if service == "kms":
+        context["kms:CallerAccount"] = get_account_id()
+        encryption_context = data.get("EncryptionContext")
+        if action == "CreateGrant":
+            constraints = data.get("Constraints") or {}
+            encryption_context = constraints.get("EncryptionContextEquals") or constraints.get("EncryptionContextSubset")
+        if action in _KMS_CONTEXT_ACTIONS and isinstance(encryption_context, dict) and encryption_context:
+            context.update({f"kms:EncryptionContext:{k}": str(v) for k, v in encryption_context.items()})
+            context["kms:EncryptionContextKeys"] = [str(k) for k in encryption_context]
+        if action in _KMS_ALGORITHM_ACTIONS and data.get("EncryptionAlgorithm"):
+            context["kms:EncryptionAlgorithm"] = data["EncryptionAlgorithm"]
+    elif service == "secretsmanager":
+        if action in _SECRET_ID_ACTIONS and data.get("SecretId"):
+            context["secretsmanager:SecretId"] = data["SecretId"]
+        if action in ("GetSecretValue", "UpdateSecretVersionStage") and data.get("VersionStage"):
+            context["secretsmanager:VersionStage"] = data["VersionStage"]
+        if action == "CreateSecret" and data.get("Name"):
+            context["secretsmanager:Name"] = data["Name"]
+        if action in ("CreateSecret", "UpdateSecret"):
+            for field in ("KmsKeyId", "Description"):
+                if data.get(field):
+                    context[f"secretsmanager:{field}"] = data[field]
+    elif service == "ssm":
+        if action == "PutParameter" and "Overwrite" in data:
+            context["ssm:Overwrite"] = "true" if data["Overwrite"] is True else "false"
+    elif service == "sns":
+        if action == "Subscribe":
+            for field in ("Protocol", "Endpoint"):
+                if _query_param(params, field):
+                    context[f"sns:{field}"] = _query_param(params, field)
+    elif service == "ec2":
+        context["ec2:Region"] = region
+    elif service == "iam":
+        boundary = None
+        if action in _IAM_BOUNDARY_REQUEST_ACTIONS:
+            boundary = _query_param(params, "PermissionsBoundary")
+        elif action in _IAM_BOUNDARY_TARGET_ACTIONS:
+            from ministack.services import iam as iam_svc
+
+            entity = (iam_svc._roles.get(_query_param(params, "RoleName")) if _query_param(params, "RoleName")
+                      else iam_svc._users.get(_query_param(params, "UserName")))
+            boundary = (entity or {}).get("PermissionsBoundary")
+            if isinstance(boundary, dict):
+                boundary = boundary.get("PermissionsBoundaryArn")
+        if boundary:
+            context["iam:PermissionsBoundary"] = boundary
+    return context
 
 
 def request_tag_context(service: str, iam_action: str, body: bytes, params: dict) -> dict:
@@ -2361,12 +2557,11 @@ def access_denied_response(service: str, action: str, principal_arn: str,
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "Message": message}).encode(),
         )
-    if (service == "kms" and not error_code and resource_arn.startswith("arn:")
-            and resource_arn.split(":")[4] != principal_arn.split(":")[4]):
-        # A key in another account: KMS does not say whether it exists (captured through AppConfig).
-        message = (f"User: {principal_arn} is not authorized to perform: {action} on this resource because the "
-                   "resource does not exist in this Region, no resource-based policies allow access, or a "
-                   "resource-based policy explicitly denies access")
+    if service == "kms" and not error_code and not explicit_deny:
+        # KMS denials no policy allows are HTTP 400 and name the key (an alias resolved to its key), as recorded on AWS.
+        from ministack.services.kms import key_arn_for_request
+
+        message = identity_denial_message(action, principal_arn, key_arn_for_request(resource_arn), explicit_deny)
         return (
             400, {"Content-Type": "application/x-amz-json-1.1"},
             json.dumps({"__type": "AccessDeniedException", "message": message}).encode(),

@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import time
+import urllib.request
 import uuid as _uuid_mod
 import zipfile
 from urllib.parse import urlparse
@@ -106,7 +107,7 @@ def test_apigwv1_account_settings_are_region_isolated():
     set_request_region("us-east-1")
     status, _headers, body = apigateway_v1._get_account()
     assert status == 200
-    assert json.loads(body)["cloudwatchRoleArn"] is None
+    assert "cloudwatchRoleArn" not in json.loads(body)
 
     status, _headers, _body = apigateway_v1._update_account(
         {"patchOperations": [{"op": "replace", "path": "/cloudwatchRoleArn", "value": east_role}]}
@@ -1586,6 +1587,125 @@ def test_api_policy_signed_call_on_a_method_without_authorization_contract(auth_
                     assert status == 200
     finally:
         apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+def _account_client(service, account):
+    """A client whose 12-digit access key selects the MiniStack account."""
+    return boto3.client(service, endpoint_url=_endpoint, aws_access_key_id=account,
+                        aws_secret_access_key="test", region_name="us-east-1")
+
+
+def _mock_ping_api(apigw, authorization):
+    """A REST API deployed to stage ``s`` whose GET /ping answers 200 {"pong": true} from a MOCK."""
+    api_id = apigw.create_rest_api(name=f"any-caller-{_uuid_mod.uuid4().hex[:8]}")["id"]
+    root_id = next(r["id"] for r in apigw.get_resources(restApiId=api_id)["items"] if r["path"] == "/")
+    resource_id = apigw.create_resource(restApiId=api_id, parentId=root_id, pathPart="ping")["id"]
+    method = {"restApiId": api_id, "resourceId": resource_id, "httpMethod": "GET"}
+    apigw.put_method(**method, authorizationType=authorization)
+    apigw.put_integration(**method, type="MOCK", requestTemplates={"application/json": '{"statusCode": 200}'})
+    apigw.put_method_response(**method, statusCode="200")
+    apigw.put_integration_response(**method, statusCode="200",
+                                   responseTemplates={"application/json": '{"pong": true}'})
+    apigw.create_deployment(restApiId=api_id, stageName="s")
+    return api_id
+
+
+def _http_get(api_id, path, headers):
+    """GET /s/<path> of a deployed API over HTTP with *headers*, unsigned."""
+    import urllib.error
+    import urllib.request
+
+    host = f"{api_id}.execute-api.localhost:{_EXECUTE_PORT}"
+    request = urllib.request.Request(f"http://{host}/s/{path}", headers={"Host": host, **headers}, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read()
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_any_caller_account_contract(auth_enabled):
+    """A REST API in another account answers an unsigned call (capture A1) and one carrying another
+    account's Authorization header (capture A2): AWS answered 200 {"pong": true} to both."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    other_account = ("AWS4-HMAC-SHA256 Credential=444455556666/20260101/us-east-1/execute-api/aws4_request, "
+                     "SignedHeaders=host, Signature=0")
+    try:
+        for headers in ({}, {"Authorization": other_account}):
+            status, body = _http_get(api_id, "ping", headers)
+            assert (status, json.loads(body)) == (200, {"pong": True}), (headers, body)
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@contextlib.contextmanager
+def _other_account_user(account):
+    """``(credentials, ARN)`` of an IAM user in *account* allowed to invoke any API; deleted on exit."""
+    from botocore.credentials import Credentials
+
+    iam = _account_client("iam", account)
+    name = f"other-account-{_uuid_mod.uuid4().hex[:8]}"
+    arn = iam.create_user(UserName=name)["User"]["Arn"]
+    iam.put_user_policy(UserName=name, PolicyName="invoke", PolicyDocument=json.dumps(_ALLOW_INVOKE))
+    key = iam.create_access_key(UserName=name)["AccessKey"]
+    try:
+        yield Credentials(key["AccessKeyId"], key["SecretAccessKey"]), arn
+    finally:
+        iam.delete_access_key(UserName=name, AccessKeyId=key["AccessKeyId"])
+        iam.delete_user_policy(UserName=name, PolicyName="invoke")
+        iam.delete_user(UserName=name)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_method_without_authorization_answers_another_accounts_user_contract(auth_enabled):
+    """A call signed by an IAM user of another account reaches a method without authorization
+    (capture A3: AWS answered 200 {"pong": true}); its valid key is checked in its own account."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "NONE")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_of_another_account_contract(auth_enabled):
+    """An AWS_IAM method of another account with no REST API policy refuses the caller under AUTH=true
+    (capture A4: 403 AccessDeniedException {"Message": "User: <caller> is not authorized to access this resource"})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    try:
+        with _other_account_user("444455556666") as (credentials, arn):
+            status, headers, body = _contract_invoke(api_id, "ping", credentials)
+        if auth_enabled:
+            assert (status, headers.get("x-amzn-ErrorType")) == (403, "AccessDeniedException"), body
+            assert json.loads(body) == {"Message": f"User: {arn} is not authorized to access this resource"}
+        else:
+            assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
+
+
+@pytest.mark.auth_contract
+def test_apigwv1_aws_iam_method_allowed_to_another_account_by_api_policy_contract(auth_enabled):
+    """A REST API policy allowing another account lets its user call an AWS_IAM method
+    (capture A5: AWS answered 200 {"pong": true})."""
+    owner = _account_client("apigateway", "111122223333")
+    api_id = _mock_ping_api(owner, "AWS_IAM")
+    owner.update_rest_api(restApiId=api_id, patchOperations=[{
+        "op": "replace", "path": "/policy",
+        "value": json.dumps(_api_policy(("Allow", {"AWS": "arn:aws:iam::444455556666:root"})))}])
+    owner.create_deployment(restApiId=api_id, stageName="s")
+    try:
+        with _other_account_user("444455556666") as (credentials, _arn):
+            status, _headers, body = _contract_invoke(api_id, "ping", credentials)
+        assert (status, json.loads(body)) == (200, {"pong": True}), body
+    finally:
+        owner.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_execute_lambda_proxy_multi_value_headers(apigw_v1, lam):
@@ -6431,6 +6551,87 @@ def test_apigwv1_import_rest_api_loads_the_definition(apigw_v1):
         assert _api_paths(apigw_v1, api["id"]) == ["/", "/ping"]
     finally:
         apigw_v1.delete_rest_api(restApiId=api["id"])
+
+
+_PATH_PARAMS_SPEC = {
+    "swagger": "2.0", "info": {"title": "path-params", "version": "1"},
+    "paths": {"/orgs/{orgId}/{proxy+}": {"options": {
+        "parameters": [
+            {"name": "orgId", "in": "path", "required": True, "type": "string"},
+            {"name": "proxy", "in": "path", "required": True, "type": "string"},
+        ],
+        "x-amazon-apigateway-integration": {"type": "mock"},
+    }}},
+}
+
+
+@pytest.mark.parametrize("mode", ["import", "put"])
+def test_apigwv1_import_keeps_the_path_parameters(apigw_v1, mode):
+    """Captured on AWS: ImportRestApi and PutRestApi turn an operation's path parameters into the method's
+    requestParameters."""
+    body = json.dumps(_PATH_PARAMS_SPEC)
+    if mode == "import":
+        api_id = apigw_v1.import_rest_api(body=body)["id"]
+    else:
+        api_id = apigw_v1.create_rest_api(name=f"params-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
+    try:
+        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                        if r["path"] == "/orgs/{orgId}/{proxy+}")
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="OPTIONS")
+        assert method["requestParameters"] == {
+            "method.request.path.orgId": True,
+            "method.request.path.proxy": True,
+        }
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
+
+
+_MOCK_OPERATION = {"x-amazon-apigateway-integration": {
+    "type": "mock", "requestTemplates": {"application/json": "{\"statusCode\": 200}"},
+    "responses": {"default": {"statusCode": "200"}}}}
+_ANY_METHOD_SPEC = {
+    "swagger": "2.0", "info": {"title": "any-method", "version": "1"},
+    "paths": {
+        "/orgs/{proxy+}": {"x-amazon-apigateway-any-method": _MOCK_OPERATION, "options": _MOCK_OPERATION},
+        "/both": {"get": _MOCK_OPERATION, "x-amazon-apigateway-any-method": _MOCK_OPERATION},
+    },
+}
+
+
+def _resource_methods(apigw_v1, api_id):
+    return {r["path"]: sorted(r.get("resourceMethods") or {})
+            for r in apigw_v1.get_resources(restApiId=api_id, limit=500)["items"]}
+
+
+@pytest.mark.parametrize("mode", ["import", "put"])
+def test_apigwv1_import_creates_the_any_method(apigw_v1, mode):
+    """Captured on AWS: ImportRestApi and PutRestApi make x-amazon-apigateway-any-method an ANY method,
+    and a request with a verb that has no method of its own goes to ANY."""
+    body = json.dumps(_ANY_METHOD_SPEC)
+    if mode == "import":
+        api_id = apigw_v1.import_rest_api(body=body)["id"]
+    else:
+        api_id = apigw_v1.create_rest_api(name=f"any-{_uuid_mod.uuid4().hex[:8]}")["id"]
+        apigw_v1.put_rest_api(restApiId=api_id, mode="overwrite", body=body)
+    try:
+        methods = _resource_methods(apigw_v1, api_id)
+        assert methods["/orgs/{proxy+}"] == ["ANY", "OPTIONS"]
+        assert methods["/both"] == ["ANY", "GET"]
+
+        proxy_id = next(r["id"] for r in apigw_v1.get_resources(restApiId=api_id)["items"]
+                        if r["path"] == "/orgs/{proxy+}")
+        method = apigw_v1.get_method(restApiId=api_id, resourceId=proxy_id, httpMethod="ANY")
+        assert method["httpMethod"] == "ANY"
+        assert method["methodIntegration"]["type"] == "MOCK"
+
+        apigw_v1.create_deployment(restApiId=api_id, stageName="test")
+        url = f"{_endpoint}/restapis/{api_id}/test/_user_request_/orgs/org1/a"
+        req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            assert resp.status == 200
+    finally:
+        apigw_v1.delete_rest_api(restApiId=api_id)
 
 
 def test_apigwv1_client_certificate_lifecycle(apigw_v1):

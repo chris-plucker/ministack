@@ -116,6 +116,9 @@ _mrap_operations = AccountScopedDict()
 _access_points = AccountRegionScopedDict()
 # The access point record a data-plane request came through, while it is handled.
 _request_access_point: contextvars.ContextVar[dict | None] = contextvars.ContextVar("s3_access_point", default=None)
+# The account that called, kept once the request is pinned to the bucket owner's account (another account's
+# bucket or access point): KMS keys are resolved in the caller's account.
+_request_caller: contextvars.ContextVar[str | None] = contextvars.ContextVar("s3_request_caller", default=None)
 
 # Object Lambda Access Points, by name within an account and region:
 # {Name, Alias: {Value, Status}, CreationDate, Configuration, Policy, PublicAccessBlockConfiguration}
@@ -125,6 +128,9 @@ _object_lambda_access_points = AccountRegionScopedDict()
 _olap_requests: dict[tuple[str, str], dict] = {}
 _olap_requests_lock = threading.Lock()
 _OBJECT_LAMBDA_ALIAS_SUFFIX = "--ol-s3"
+
+# Account-level public access block, per account (it applies in every region): {"config": {flags}}.
+_account_public_access_block = AccountScopedDict()
 
 
 def object_lambda_arn(name: str, account_id: str | None = None, region: str | None = None) -> str:
@@ -191,12 +197,13 @@ def resolve_access_point_alias(alias: str):
 _ACCESS_POINT_ALIAS_SUFFIX = "-s3alias"
 
 
-def access_point_for_alias(alias: str) -> tuple[str, str, dict] | None:
-    """``(access point ARN, bucket, condition keys)`` of an alias in the caller's account, for IAM checks."""
+def access_point_for_alias(alias: str, foreign: bool = False) -> tuple[str, str, dict] | None:
+    """``(access point ARN, bucket, condition keys)`` of an alias for IAM checks: in the caller's account,
+    or in any account with *foreign* (a PutObject through another account's access point)."""
     if not alias.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
         return None
     resolved = resolve_access_point_alias(alias)
-    if resolved is None or resolved[0] != get_account_id():
+    if resolved is None or (resolved[0] != get_account_id() and not foreign):
         return None
     account, region, record = resolved
     arn = access_point_arn(record["Name"], account, region)
@@ -217,6 +224,13 @@ def access_point_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     return (record.get("Policy") or "", arn.account_id) if record else None
 
 
+def is_foreign_access_point_put(method: str, key: str, headers: dict, query_params: dict) -> bool:
+    """Whether a request is a plain PutObject, the one operation served through another account's access point
+    (the only one recorded on AWS, us-east-2): not a part, a copy or a sub-resource write."""
+    return (method == "PUT" and bool(key) and "x-amz-copy-source" not in headers
+            and not set(query_params) - {"x-id"})
+
+
 def _resolve_copy_source_alias(headers: dict) -> tuple:
     """``(headers, denied)``: an ``x-amz-copy-source`` access point alias rewritten to its bucket."""
     source = headers.get("x-amz-copy-source", "")
@@ -231,17 +245,17 @@ def _resolve_copy_source_alias(headers: dict) -> tuple:
     return {**headers, "x-amz-copy-source": f"{resolved[2]['Bucket']}/{rest}"}, None
 
 
-def resolve_access_point_host(name: str, account_id: str, signed_region: str | None):
+def resolve_access_point_host(name: str, account_id: str, signed_region: str | None, allow_foreign: bool = False):
     """The target of an access point host ``<name>-<account>.<host>`` as
     ``(bucket, access point region, error)``, or None when no such access
     point exists (the host then names a bucket). An access point in another
     region than the signing one still resolves, so the region check answers
-    with the access point's region."""
+    with the access point's region. ``allow_foreign`` serves another account's."""
     regions = access_point_regions(name, account_id)
     if not regions:
         return None
-    if account_id != get_account_id():
-        # Requests from another account through an access point are refused.
+    if account_id != get_account_id() and not allow_foreign:
+        # Requests from another account through an access point are refused, a PutObject excepted.
         return None, None, _error("AccessDenied", "Access Denied", 403, f"/{name}")
     region = signed_region if signed_region in regions else regions[0]
     return resolve_access_point(name, account_id, region)["Bucket"], region, None
@@ -431,6 +445,7 @@ _PERSISTED_BUCKET_DICTS = {
     "mrap_operations": _mrap_operations,
     "access_points": _access_points,
     "object_lambda_access_points": _object_lambda_access_points,
+    "account_public_access_block": _account_public_access_block,
 }
 
 
@@ -772,6 +787,18 @@ def _reschedule_restores() -> None:
 # only its MD5, which is all AWS keeps visible too.
 # ---------------------------------------------------------------------------
 
+# NoSuchUpload's message (recorded on AWS, us-east-2).
+_NO_SUCH_UPLOAD_MESSAGE = (
+    "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted "
+    "or completed."
+)
+
+
+def _no_such_upload(upload_id: str) -> tuple:
+    """NoSuchUpload as every multipart operation answers it: the message and ``<UploadId>``, no
+    ``<Resource>`` (recorded on AWS, us-east-2, for an unknown upload id and one used under another key)."""
+    return _object_error("NoSuchUpload", _NO_SUCH_UPLOAD_MESSAGE, 404, UploadId=upload_id or "")
+
 # The SSE headers persisted on an object (the customer KEY is deliberately
 # not among them).
 _SSE_STORED_HEADERS = (
@@ -779,6 +806,7 @@ _SSE_STORED_HEADERS = (
     "x-amz-server-side-encryption-aws-kms-key-id",
     "x-amz-server-side-encryption-customer-algorithm",
     "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-server-side-encryption-bucket-key-enabled",
 )
 
 
@@ -824,19 +852,75 @@ def _validate_sse_c_headers(c_alg: str, c_key: str, c_md5: str):
     return None
 
 
-def _resolve_sse_write_headers(headers: dict, bucket_name: str):
+_SSE_KMS_KEY_HEADER = "x-amz-server-side-encryption-aws-kms-key-id"
+
+
+def _resolve_kms_write(headers: dict, bucket_name: str, reject_orphan_key: bool = False):
+    """The KMS key ARN a write encrypts with and the error it earns, as ``(arn | None, error | None)``.
+
+    Recorded on AWS, us-east-2, ahead of any authorization: a key header needs ``aws:kms`` (a key ID with
+    AES256 or no SSE header is InvalidArgument); ``aws:kms`` without a key header takes the account's
+    ``aws/s3`` key; the bucket default applies when the request sends no SSE header and names its key
+    the same way.  A key KMS refuses is refused with KMS's own error.  An SSE-C request is not looked at.
+    """
+    from ministack.services.kms import resolve_key_for_s3
+
+    if any(h.startswith("x-amz-server-side-encryption-customer-") for h in headers):
+        return None, None
+    sse = headers.get("x-amz-server-side-encryption", "")
+    key_ref = headers.get(_SSE_KMS_KEY_HEADER) or None
+    if sse in ("", "AES256"):
+        if key_ref and reject_orphan_key:
+            fields = {"ArgumentName": "x-amz-server-side-encryption", **({"ArgumentValue": sse} if sse else {})}
+            return None, _object_error(
+                "InvalidArgument",
+                "Server Side Encryption with AWS KMS managed key requires HTTP header "
+                "x-amz-server-side-encryption : aws:kms",
+                400,
+                **fields,
+            )
+        if sse:
+            return None, None
+        default_bucket = _condition_bucket_name(bucket_name)
+        if default_bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX) and (found := resolve_access_point_alias(default_bucket)):
+            # Another account's access point: its bucket's default applies.
+            bucket_owner, default_bucket = found[0], found[2]["Bucket"]
+        else:
+            # The bucket owner's default, also for another account's bucket before the request is pinned to it.
+            bucket_owner = _bucket_owner_account(default_bucket) or get_account_id()
+        with request_scope(bucket_owner, get_region()):
+            default = _bucket_default_sse_headers(default_bucket)
+        if default.get("x-amz-server-side-encryption") != "aws:kms":
+            return None, None
+        key_ref = default.get(_SSE_KMS_KEY_HEADER)
+    elif sse not in ("aws:kms", "aws:kms:dsse"):
+        return None, None
+    elif headers.get(_SSE_KMS_KEY_HEADER) == "":
+        # An empty key header with aws:kms is S3's InternalError, ahead of any authorization (recorded on AWS,
+        # us-east-2).
+        return None, _object_error("InternalError", "We encountered an internal error. Please try again.", 500)
+    # The key is resolved in the caller's account, also once the request is pinned to a bucket owner's.
+    with request_scope(_request_caller.get() or get_account_id(), get_region()):
+        arn, err = resolve_key_for_s3(key_ref)
+    if err:
+        return None, _object_error(*err)
+    return arn, None
+
+
+def _resolve_sse_write_headers(headers: dict, bucket_name: str, reject_orphan_key: bool = False):
     """Validate a write's SSE headers and return (headers_to_persist, error).
 
     SSE-S3/KMS and SSE-C are mutually exclusive (InvalidArgument together, as
-    AWS answers).  `aws:kms` must name a key: MiniStack has no implicit
-    account `aws/s3` KMS key to fall back to, and ceph/s3-tests pins the
-    refusal.  A write with no SSE headers takes the bucket's explicit default
-    encryption configuration, so the applied algorithm is visible on later
-    reads and not only stamped on the PUT reply."""
+    AWS answers).  `aws:kms` without a key id takes the account's `aws/s3`
+    key, and the key is persisted and echoed as its ARN, whatever the request
+    named it by.  A write with no SSE headers takes the bucket's explicit
+    default encryption configuration, so the applied algorithm is visible on
+    later reads and not only stamped on the PUT reply."""
     sse = headers.get("x-amz-server-side-encryption", "")
     c_alg = headers.get("x-amz-server-side-encryption-customer-algorithm", "")
     c_key = headers.get("x-amz-server-side-encryption-customer-key", "")
     c_md5 = headers.get("x-amz-server-side-encryption-customer-key-md5", "")
+    bucket_key = headers.get("x-amz-server-side-encryption-bucket-key-enabled", "").lower()
 
     if sse and (c_alg or c_key or c_md5):
         return None, _error(
@@ -845,20 +929,17 @@ def _resolve_sse_write_headers(headers: dict, bucket_name: str):
             "with the encryption method specified.",
             400,
         )
+    kms_arn, kms_err = _resolve_kms_write(headers, bucket_name, reject_orphan_key)
+    if kms_err is not None:
+        return None, kms_err
     if sse:
         if sse not in ("AES256", "aws:kms"):
             return None, _error("InvalidArgument", f"Invalid x-amz-server-side-encryption value: {sse}", 400)
         out = {"x-amz-server-side-encryption": sse}
         if sse == "aws:kms":
-            kms = headers.get("x-amz-server-side-encryption-aws-kms-key-id", "")
-            if not kms:
-                return None, _error(
-                    "InvalidArgument",
-                    "Server-side encryption with aws:kms requires a key id in "
-                    "x-amz-server-side-encryption-aws-kms-key-id.",
-                    400,
-                )
-            out["x-amz-server-side-encryption-aws-kms-key-id"] = kms
+            out[_SSE_KMS_KEY_HEADER] = kms_arn
+            if bucket_key:
+                out["x-amz-server-side-encryption-bucket-key-enabled"] = bucket_key
         return out, None
     if c_alg or c_key or c_md5:
         err = _validate_sse_c_headers(c_alg, c_key, c_md5)
@@ -868,7 +949,12 @@ def _resolve_sse_write_headers(headers: dict, bucket_name: str):
             "x-amz-server-side-encryption-customer-algorithm": "AES256",
             "x-amz-server-side-encryption-customer-key-md5": c_md5,
         }, None
-    return dict(_bucket_default_sse_headers(bucket_name)), None
+    default = dict(_bucket_default_sse_headers(bucket_name))
+    if default.get("x-amz-server-side-encryption") == "aws:kms":
+        default[_SSE_KMS_KEY_HEADER] = kms_arn
+        if bucket_key:
+            default["x-amz-server-side-encryption-bucket-key-enabled"] = bucket_key
+    return default, None
 
 
 def _stored_sse_headers(obj: dict) -> dict:
@@ -1013,6 +1099,23 @@ def _get_object_data(bucket_name: str, key: str, version_id: str | None = None) 
     return _read_body(bucket_name, key, obj)
 
 
+def _get_object_data_for_caller(bucket_name: str, key: str, version_id: str | None = None) -> bytes | None:
+    """Object bytes as the current account may read them, or None.
+
+    A bucket name identifies one bucket for every account. A bucket that another
+    account owns answers only when the owner's ACLs or bucket policy allow the
+    caller's GetObject, as for an S3 request."""
+    owner = _bucket_owner_for_caller(bucket_name)
+    caller = get_account_id()
+    if owner is None or owner == caller:
+        return _get_object_data(bucket_name, key, version_id)
+    query_params = {"versionId": version_id} if version_id else {}
+    if not _foreign_bucket_allows(owner, bucket_name, key, "GET", query_params, caller):
+        return None
+    with request_scope(owner, get_region()):
+        return _get_object_data(bucket_name, key, version_id)
+
+
 _ACL_GROUP_AUTHENTICATED = "http://acs.amazonaws.com/groups/global/AuthenticatedUsers"
 # The permissions that answer an object read, FULL_CONTROL included.
 _ACL_READ_PERMS = ("READ", "FULL_CONTROL")
@@ -1045,7 +1148,9 @@ def _acl_grants(stored_xml: str | None, grantee: str = "URI") -> list[tuple[str,
 
 
 def _public_access_blocked(owner_account: str, bucket_name: str, setting: str) -> bool:
-    """Whether the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    """Whether the account's, the bucket's or the request's access point's Public Access Block turns *setting* on."""
+    if (_account_public_access_block.get_scoped(owner_account, None, "config") or {}).get(setting):
+        return True
     access_point = _request_access_point.get()
     # An access point's BlockPublicPolicy does not cover the bucket's policy.
     if access_point and access_point["Bucket"] == bucket_name and setting != "BlockPublicPolicy" and \
@@ -1081,10 +1186,17 @@ def _bucket_owner_account(name: str) -> str | None:
     within a partition" — so a name identifies one bucket, whoever asks. The
     store stays account-scoped; this is the index over it.
     """
-    for account_id, bucket_name in _buckets._data:
+    # A copy of the keys: internal reads call this from worker threads.
+    for account_id, bucket_name in list(_buckets._data):
         if bucket_name == name:
             return account_id
     return None
+
+
+def _bucket_owner_for_caller(name: str) -> str | None:
+    """The account whose bucket *name* the current caller reads: its own, else the owner, or None."""
+    caller = get_account_id()
+    return caller if _buckets.contains_scoped(caller, None, name) else _bucket_owner_account(name)
 
 
 # A Multi-Region Access Point or an object through it: arn:aws:s3::<account>:accesspoint/<alias>[/object/<key>].
@@ -1107,22 +1219,70 @@ def bucket_policy_for_arn(resource_arn: str) -> tuple[str, str] | None:
     return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
 
 
-def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
-    """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+def bucket_policy_for_owner(resource_arn: str, owner: str) -> tuple[str, str] | None:
+    """The policy and owner of a bucket another account owns, for the bucket check of a PutObject through
+    that account's access point."""
+    if not resource_arn.startswith("arn:aws:s3:::"):
+        return None
+    bucket = resource_arn[len("arn:aws:s3:::"):].split("/", 1)[0]
+    if not _buckets.contains_scoped(owner, None, bucket):
+        return None
+    return _bucket_policies.get_scoped(owner, None, bucket) or "", owner
+
+
+def _condition_bucket_name(bucket_name: str) -> str:
+    """The bucket an identity check is about: an access point alias of this account resolved to its bucket."""
     if bucket_name.endswith(_ACCESS_POINT_ALIAS_SUFFIX):
         resolved = resolve_access_point_alias(bucket_name)
         if resolved is not None and resolved[0] == get_account_id():
-            bucket_name = resolved[2]["Bucket"]
+            return resolved[2]["Bucket"]
+    return bucket_name
+
+
+def object_tags_for_condition(bucket_name: str, key: str, query_params: dict) -> dict:
+    """The tags of the object version a read names, for ``s3:ExistingObjectTag`` in the identity check."""
+    bucket_name = _condition_bucket_name(bucket_name)
     bucket = _buckets.get(bucket_name)
     if bucket is None:
         return {}
     return _object_tags.get((bucket_name, key, _resolve_subresource_version(query_params, bucket, key)), {})
 
 
-def upload_encryption_header(upload_id: str) -> str | None:
+def _upload_in_bucket_scope(bucket_name: str, upload_id: str) -> dict | None:
+    """The multipart upload, read in the bucket owner's account: before the request is pinned to the owner, an
+    upload in another account's bucket is not in the caller's state."""
+    owner = _bucket_owner_account(_condition_bucket_name(bucket_name)) or get_account_id()
+    with request_scope(owner, get_region()):
+        return _multipart_uploads.get(upload_id)
+
+
+def upload_encryption_header(upload_id: str, bucket_name: str = "") -> str | None:
     """The ``x-amz-server-side-encryption`` its CreateMultipartUpload carried, for the identity check of a part."""
-    upload = _multipart_uploads.get(upload_id)
+    upload = _upload_in_bucket_scope(bucket_name, upload_id) if bucket_name else _multipart_uploads.get(upload_id)
     return upload.get("requested_sse") if upload else None
+
+
+def _write_kms_key(bucket_name: str, headers: dict) -> str | None:
+    """The ARN of the KMS key a write encrypts with, or None.
+
+    ``aws:kms`` without a key header and an ``aws:kms`` bucket default without a key take the ``aws/s3``
+    key; an SSE header of its own (AES256 included) overrides the bucket default; a key KMS refuses is None
+    (all recorded on AWS, us-east-2: that write fails before the policy).
+    """
+    return _resolve_kms_write(headers, bucket_name)[0]
+
+
+def kms_key_for_condition(bucket_name: str, headers: dict, upload_id: str | None = None) -> str | None:
+    """The key ARN of ``s3:x-amz-server-side-encryption-aws-kms-key-id`` for a PutObject, or None.
+
+    AWS holds the key ARN whether the request names the key by ID, alias, alias ARN or ARN, in this
+    account or another; a part, a part copy and the completion carry the key their upload started with
+    (recorded on AWS, us-east-2).
+    """
+    if upload_id:
+        upload = _upload_in_bucket_scope(bucket_name, upload_id)
+        return upload.get("kms_key") if upload else None
+    return _write_kms_key(_condition_bucket_name(bucket_name), headers)
 
 
 def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
@@ -1155,6 +1315,13 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
                 if uri in groups and permission in granted:
                     return True
 
+    return _bucket_policy_allows(owner_account, bucket_name, key, method, query_params, caller, headers)
+
+
+def _bucket_policy_allows(owner_account: str, bucket_name: str, key: str, method: str, query_params: dict,
+                          caller: str, headers: dict | None = None, extra_context: dict | None = None) -> bool:
+    """Whether the owner's bucket policy allows the caller's account (anonymous when *caller* is empty);
+    *extra_context* adds request condition keys, an access point's."""
     policy = _bucket_policies.get_scoped(owner_account, None, bucket_name)
     if policy and not (_public_access_blocked(owner_account, bucket_name, "RestrictPublicBuckets")
                        and _policy_is_public(policy)):
@@ -1173,11 +1340,31 @@ def _foreign_bucket_allows(owner_account: str, bucket_name: str, key: str,
             action=action,
             resource_arn=f"{resource}/{key}" if key else resource,
             region=get_region(),
-            service_context={k.lower(): v for k, v in service_context.items()},
+            service_context={k.lower(): v for k, v in {**service_context, **(extra_context or {})}.items()},
         )
         if evaluate_resource_policy(policy, ctx).decision == "Allow":
             return True
     return False
+
+
+def _foreign_access_point_allows(owner_account: str, caller: str, record: dict, region: str, key: str,
+                                 headers: dict) -> bool:
+    """Without IAM enforcement, whether the owner's grants let another account PutObject through its access
+    point, as ``_foreign_bucket_allows`` decides a direct request: the access point policy and the bucket
+    policy must both allow the caller's account."""
+    from ministack.core.iam_evaluator import EvalContext, evaluate_resource_policy
+
+    arn = access_point_arn(record["Name"], owner_account, region)
+    keys = {"s3:DataAccessPointArn": arn, "s3:DataAccessPointAccount": owner_account,
+            "s3:AccessPointNetworkOrigin": record["NetworkOrigin"]}
+    ctx = EvalContext(
+        principal_arn=f"arn:aws:iam::{caller}:root", principal_type="Root", principal_account=caller,
+        action="s3:PutObject", resource_arn=f"{arn}/object/{key}", region=get_region(),
+        service_context={k.lower(): v for k, v in keys.items()},
+    )
+    if not _bucket_policy_allows(owner_account, record["Bucket"], key, "PUT", {}, caller, headers, keys):
+        return False
+    return evaluate_resource_policy(record.get("Policy") or "", ctx).decision == "Allow"
 
 
 def _foreign_object_acl(owner_account: str, bucket_name: str, key: str, method: str,
@@ -1250,6 +1437,15 @@ def bucket_region(name: str) -> str | None:
     if record is None:
         return None
     return record.get("region") or os.environ.get("MINISTACK_REGION", "us-east-1")
+
+
+def _bucket_region_for_caller(name: str) -> str | None:
+    """Home region of the bucket *name* that the current caller reads, in the account that owns it."""
+    owner = _bucket_owner_for_caller(name)
+    if owner is None:
+        return None
+    with request_scope(owner, get_region()):
+        return bucket_region(name)
 
 
 _REGION_LABEL_RE = re.compile(r"^[a-z]{2}(?:-[a-z]+)+-\d+$")
@@ -1478,6 +1674,77 @@ def format_head_response(path: str, headers: dict, response: tuple) -> tuple:
         if status == 200:
             response_headers["x-amz-bucket-arn"] = f"arn:aws:s3:::{bucket}"
     return status, response_headers, b""
+
+
+def validate_write_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
+    """Before IAM, the encryption and upload-id answers S3 gives ahead of any authorization.
+
+    Recorded on AWS, us-east-2, under a bucket policy denying PutObject, an identity policy without an S3
+    allow and an explicit identity deny: PutObject, CopyObject and CreateMultipartUpload answer the SSE
+    header errors and KMS's refusal of the key, UploadPart and CompleteMultipartUpload answer NoSuchUpload
+    for an unknown upload.  Only an authenticated request for an existing bucket; the rest keep their
+    paths.
+    """
+    from ministack.core.iam_evaluator import AuthError, authenticate
+    from ministack.core.sigv4 import parse_header_signature
+
+    bucket, key = _parse_bucket_key(path, headers)
+    if not bucket or not key or not headers.get("authorization", "").startswith("AWS4-HMAC-SHA256"):
+        return None
+    if _write_operation(method, headers, query_params) is None:
+        return None
+    signature = parse_header_signature(headers)
+    if isinstance(signature, tuple) or isinstance(authenticate(signature.access_key_id, get_account_id()), AuthError):
+        return None  # The shared malformed-signature and authentication answers.
+    return write_request_error(method, bucket, key, headers, query_params)
+
+
+def _write_operation(method: str, headers: dict, query_params: dict) -> str | None:
+    """``write`` (PutObject, CopyObject, CreateMultipartUpload), ``part`` (UploadPart) or ``complete``."""
+    params = set(query_params) - {"x-id"}
+    copy = "x-amz-copy-source" in headers
+    if method == "PUT" and not params:
+        operation = "write"  # PutObject or CopyObject
+    elif method == "POST" and params == {"uploads"}:
+        operation = "write"  # CreateMultipartUpload
+    elif method == "PUT" and params == {"partNumber", "uploadId"} and not copy:
+        operation = "part"
+    elif method == "POST" and params == {"uploadId"}:
+        operation = "complete"
+    else:
+        return None
+    return operation
+
+
+def write_request_error(method: str, bucket: str, key: str, headers: dict, query_params: dict) -> tuple | None:
+    """The encryption and upload-id answer S3 gives a write ahead of any authorization, or None.
+
+    Shared by the pre-IAM check and, without IAM, by the handler ahead of the owner's grants of another account's
+    bucket or access point, so both modes answer in AWS's order.
+    """
+    operation = _write_operation(method, headers, query_params)
+    if operation is None or not bucket or not key:
+        return None
+    upload_id = _qp(query_params, "uploadId")
+    resolved = _condition_bucket_name(bucket)
+    if (resolved.endswith(_ACCESS_POINT_ALIAS_SUFFIX) and is_foreign_access_point_put(method, key, headers, query_params)
+            and (found := resolve_access_point_alias(resolved))):
+        resolved, alias = found[2]["Bucket"], resolved  # Another account's access point, as its bucket.
+    else:
+        alias = resolved
+    if _bucket_owner_account(resolved) is None:
+        return None
+    if operation == "write":
+        _, error = _resolve_kms_write(headers, alias, reject_orphan_key=True)
+        return error
+    with request_scope(_bucket_owner_account(resolved) or get_account_id(), get_region()):
+        known = upload_id in _multipart_uploads
+        cached = _completed_multipart_uploads.get(upload_id)
+    if known:
+        return None
+    if operation == "complete" and cached is not None and cached.get("key") == key:
+        return None
+    return _no_such_upload(upload_id)
 
 
 def validate_object_request(method: str, path: str, headers: dict, query_params: dict) -> tuple | None:
@@ -2515,6 +2782,14 @@ async def handle_request(
     # reach the handlers exactly as a header-signed request delivers them.
     headers = _merge_hoisted_amz_headers(headers, query_params)
 
+    from ministack.app import AUTH as _AUTH
+    if not _AUTH and not internal:
+        # Without IAM there is no pre-IAM check: answer the write's encryption and upload-id errors here, before
+        # the owner's grants of another account's bucket or access point, as AWS does.
+        early = write_request_error(method, bucket, key, headers, query_params)
+        if early is not None:
+            return early
+
     if (access_point_region is not None or bucket.endswith(_ACCESS_POINT_ALIAS_SUFFIX)) and not internal:
         from ministack.app import AUTH
 
@@ -2542,20 +2817,39 @@ async def handle_request(
         resolved = resolve_access_point_alias(bucket)
         if resolved is not None:
             account, access_point_region, record = resolved
-            if account != get_account_id():
+            if account != get_account_id() and not is_foreign_access_point_put(method, key, headers, query_params):
                 return _error("AccessDenied", "Access Denied", 403, f"/{bucket}")
             bucket, access_point = record["Bucket"], record
     headers, denied = _resolve_copy_source_alias(headers)
     if denied is not None:
         return denied
 
-    denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
+    caller_token = _request_caller.set(get_account_id())
+    if (access_point is not None and not internal and access_point.get("BucketAccountId", get_account_id()) != get_account_id()
+            and is_foreign_access_point_put(method, key, headers, query_params)):
+        # Another account's access point: the owner's grants were checked as IAM policies under AUTH=true,
+        # and are here without it. The request then runs in the owner's account, the caller kept for its KMS key.
+        from ministack.app import AUTH
+
+        owner = access_point["BucketAccountId"]
+        # An unsigned request is anonymous, never the default account: through another account's access point it
+        # is refused, as access points take signed requests only under AUTH=true too.
+        caller = get_account_id() if _request_access_key(method, key, headers, query_params, body) else ""
+        if not AUTH and not (caller and _foreign_access_point_allows(owner, caller, access_point,
+                                                                     access_point_region, key, headers)):
+            _request_caller.reset(caller_token)
+            return _error("AccessDenied", "Access Denied", 403, f"/{bucket}/{key}")
+        set_request_account_id(owner)
+        denied = None
+    else:
+        denied = _apply_bucket_scope(method, bucket, key, headers, query_params, body, internal)
     if denied is None:
         denied = _region_set_mismatch(bucket, key, headers, query_params, home=access_point_region)
     if denied is None and enforce_bucket_region:
         # After the scope is pinned, so the owner's record names the home region.
         denied = _check_bucket_region(method, bucket, key, headers, query_params, home=access_point_region)
     if denied is not None:
+        _request_caller.reset(caller_token)
         status, resp_headers, resp_body = denied
         resp_headers.setdefault("x-amz-request-id", new_uuid())
         resp_headers.setdefault("x-amz-id-2", base64.b64encode(os.urandom(48)).decode())
@@ -2566,6 +2860,7 @@ async def handle_request(
         result = _dispatch(method, bucket, key, headers, body, query_params)
     finally:
         _request_access_point.reset(token)
+        _request_caller.reset(caller_token)
 
     status, resp_headers, resp_body = result
     resp_headers.setdefault("x-amz-request-id", new_uuid())
@@ -2717,7 +3012,7 @@ def _dispatch(method: str, bucket: str, key: str, headers: dict, body: bytes, qu
         if "encryption" in query_params:
             return _put_bucket_encryption(bucket, body)
         if "lifecycle" in query_params:
-            return _put_bucket_lifecycle(bucket, body)
+            return _put_bucket_lifecycle(bucket, body, headers)
         if "cors" in query_params:
             return _put_bucket_cors(bucket, body)
         if "acl" in query_params:
@@ -3269,6 +3564,8 @@ def _bucket_default_sse_headers(bucket_name: str) -> dict:
         kms = _first_text("KMSMasterKeyID")
         if kms:
             out["x-amz-server-side-encryption-aws-kms-key-id"] = kms
+        if (_first_text("BucketKeyEnabled") or "").lower() == "true":
+            out["x-amz-server-side-encryption-bucket-key-enabled"] = "true"
     return out
 
 
@@ -3283,9 +3580,12 @@ def _get_bucket_lifecycle(name: str):
             xml += "<Rule>"
             if rule.get("ID"):
                 xml += f"<ID>{_esc(rule['ID'])}</ID>"
+            legacy = "Filter" not in rule and "Prefix" in rule
+            if legacy:
+                xml += f"<Prefix>{_esc(rule['Prefix'])}</Prefix>"
             # Filter
             filt = rule.get("Filter", {})
-            xml += "<Filter>"
+            xml += "" if legacy else "<Filter>"
             if "Prefix" in filt:
                 xml += f"<Prefix>{_esc(filt['Prefix'])}</Prefix>"
             if "Tag" in filt:
@@ -3307,7 +3607,7 @@ def _get_bucket_lifecycle(name: str):
                 if and_f.get("ObjectSizeLessThan"):
                     xml += f"<ObjectSizeLessThan>{and_f['ObjectSizeLessThan']}</ObjectSizeLessThan>"
                 xml += "</And>"
-            xml += "</Filter>"
+            xml += "" if legacy else "</Filter>"
             xml += f"<Status>{rule.get('Status', 'Enabled')}</Status>"
             for t in rule.get("Transitions", []):
                 xml += "<Transition>"
@@ -3354,7 +3654,8 @@ def _get_bucket_lifecycle(name: str):
             200,
             {
                 "Content-Type": "application/xml",
-                "x-amz-transition-default-minimum-object-size": "all_storage_classes_128K",
+                "x-amz-transition-default-minimum-object-size":
+                    _buckets[name].get("_lifecycle_min_object_size", "all_storage_classes_128K"),
             },
             xml.encode(),
         )
@@ -3366,7 +3667,7 @@ def _get_bucket_lifecycle(name: str):
     )
 
 
-def _put_bucket_lifecycle(name: str, body: bytes):
+def _put_bucket_lifecycle(name: str, body: bytes, headers: dict | None = None):
     if name not in _buckets:
         return _no_such_bucket(name)
     # Parse incoming XML into structured rules for canonical GET responses.
@@ -3426,7 +3727,11 @@ def _put_bucket_lifecycle(name: str, body: bytes):
                     if lt:
                         and_data["ObjectSizeLessThan"] = int(lt)
                     filt["And"] = and_data
-            rule["Filter"] = filt
+            legacy_prefix = _lc_find(rule_el, "Prefix")
+            if legacy_prefix is not None and filt_el is None:
+                rule["Prefix"] = _lc_text(rule_el, "Prefix")
+            else:
+                rule["Filter"] = filt
             # Transitions
             transitions = []
             for t in _lc_findall(rule_el, "Transition"):
@@ -3493,8 +3798,10 @@ def _put_bucket_lifecycle(name: str, body: bytes):
     err = _lifecycle_rules_error(rules)
     if err:
         return err
+    min_size = (headers or {}).get("x-amz-transition-default-minimum-object-size") or "all_storage_classes_128K"
     _bucket_lifecycle[name] = rules
-    return 200, {"x-amz-transition-default-minimum-object-size": "all_storage_classes_128K"}, b""
+    _buckets[name]["_lifecycle_min_object_size"] = min_size
+    return 200, {"x-amz-transition-default-minimum-object-size": min_size}, b""
 
 
 _TRANSITION_STORAGE_CLASSES = ("GLACIER", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "DEEP_ARCHIVE", "GLACIER_IR")
@@ -4813,7 +5120,7 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
     if csum_err:
         return csum_err
 
-    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
     if sse_err:
         return sse_err
 
@@ -4871,12 +5178,17 @@ def _put_object(bucket_name: str, key: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        # A new object: an overwritten one's tags do not carry over.
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
     if canned_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = _canned_acl_policy_xml(
             canned_acl, _canonical_owner_id()
         )
     elif grant_acl:
         _object_acl[(bucket_name, key, obj.get("version_id"))] = grant_acl
+    else:
+        _object_acl.pop((bucket_name, key, obj.get("version_id")), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -5277,8 +5589,12 @@ def _post_object(bucket_name: str, body: bytes, headers: dict):
             with _in_account(dest_account):
                 _object_tags[(dest_name, key, replica_version)] = dict(pending_tags)
                 _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, version_id), None)
     if canned_acl:
         _object_acl[(bucket_name, key, version_id)] = _canned_acl_policy_xml(canned_acl, _canonical_owner_id())
+    else:
+        _object_acl.pop((bucket_name, key, version_id), None)
 
     # Persist only after the versioning block: the .meta.json sidecar must
     # carry the version_id assigned above (#1058), and the tags and ACL.
@@ -6480,7 +6796,7 @@ def _copy_object(bucket_name: str, dest_key: str, headers: dict):
     # The destination's encryption always comes from THIS request (or the
     # destination bucket's default), never from the source — a COPY metadata
     # directive must not smuggle the source's SSE state across.
-    dest_sse, dest_sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    dest_sse, dest_sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
     if dest_sse_err is not None:
         return dest_sse_err
     for h in _SSE_STORED_HEADERS:
@@ -7356,6 +7672,7 @@ def _put_object_retention(bucket_name: str, key: str, body: bytes, headers: dict
         "Mode": mode_el.text,
         "RetainUntilDate": retain_until,
     }
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {"Content-Type": "application/xml"}, b""
 
 
@@ -7406,6 +7723,7 @@ def _put_object_legal_hold(bucket_name: str, key: str, body: bytes, query_params
         return _error("MalformedXML", _MALFORMED_XML, 400)
 
     _object_legal_hold[lock_key] = status_el.text
+    _persist_version_state(bucket_name, key, bucket)
     return 200, {"Content-Type": "application/xml"}, b""
 
 
@@ -7810,6 +8128,9 @@ def _parse_replication_options(rule_el) -> tuple[dict, dict]:
             name: _replication_status(_replication_children(el, ("Status",)))
             for name, el in _replication_children(
                 ssc_el, ("SseKmsEncryptedObjects", "ReplicaModifications")).items()}
+    eor_el = _replication_option(rule_el, "ExistingObjectReplication")
+    if eor_el is not None:
+        rule_opts["ExistingObjectReplication"] = _replication_status(_replication_children(eor_el, ("Status",)))
     dest_el = _find_xml_tag(rule_el, "Destination")
     if dest_el is None:
         return rule_opts, dest_opts
@@ -7942,6 +8263,12 @@ def _replication_ssc_xml(rule_el, rule: dict) -> None:
     for name in ("SseKmsEncryptedObjects", "ReplicaModifications"):
         if name in rule["SourceSelectionCriteria"]:
             SubElement(SubElement(ssc_el, name), "Status").text = rule["SourceSelectionCriteria"][name]["Status"]
+
+
+def _replication_eor_xml(rule_el, rule: dict) -> None:
+    if "ExistingObjectReplication" in rule:
+        SubElement(SubElement(rule_el, "ExistingObjectReplication"), "Status").text = (
+            rule["ExistingObjectReplication"]["Status"])
 
 
 def _replication_destination_options_xml(dest_el, dest: dict) -> None:
@@ -8087,6 +8414,7 @@ def _get_bucket_replication(bucket_name: str):
             SubElement(dmr_el, "Status").text = (rule["DeleteMarkerReplication"] or {}).get(
                 "Status", "Disabled")
         _replication_ssc_xml(rule_el, rule)
+        _replication_eor_xml(rule_el, rule)
         dest = rule.get("Destination", {})
         if dest:
             dest_el = SubElement(rule_el, "Destination")
@@ -8467,13 +8795,22 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
     if sc_err:
         return sc_err
 
-    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name)
+    sse_headers, sse_err = _resolve_sse_write_headers(headers, bucket_name, reject_orphan_key=True)
     if sse_err:
         return sse_err
 
     checksum_algorithm, csum_err = _resolve_multipart_checksum_algorithm(headers)
     if csum_err:
         return csum_err
+
+    # x-amz-tagging is validated here, as PutObject does, and stored on the
+    # upload until CompleteMultipartUpload cuts the object's version.
+    tags = None
+    tagging_header = headers.get("x-amz-tagging", "")
+    if tagging_header:
+        tags = {k: v[0] for k, v in _parse_qs(tagging_header, keep_blank_values=True).items()}
+        if len(tags) > 10:
+            return _error("BadRequest", "Object tags cannot be greater than 10", 400)
 
     upload_id = new_uuid()
     content_type = headers.get("content-type", "application/octet-stream")
@@ -8495,8 +8832,10 @@ def _create_multipart_upload(bucket_name: str, key: str, headers: dict):
         "content_encoding": content_encoding,
         "preserved_headers": preserved,
         "requested_sse": headers.get("x-amz-server-side-encryption"),
+        "kms_key": sse_headers.get(_SSE_KMS_KEY_HEADER),
         "storage_class": storage_class,
         "checksum_algorithm": checksum_algorithm,
+        "tags": tags,
         "created": now_iso(),
     }
 
@@ -8522,21 +8861,11 @@ def _upload_part(bucket_name: str, key: str, body: bytes, query_params: dict, he
     part_number = _qp(query_params, "partNumber")
 
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     sse_part_err = _check_sse_c_part(headers, upload)
     if sse_part_err is not None:
@@ -8585,7 +8914,7 @@ def _upload_part_copy(bucket_name: str, dest_key: str, query_params: dict, heade
     part_number = int(_qp(query_params, "partNumber", "1"))
 
     if upload_id not in _multipart_uploads:
-        return _error("NoSuchUpload", "The specified multipart upload does not exist.", 404)
+        return _no_such_upload(upload_id)
 
     sse_part_err = _check_sse_c_part(headers, _multipart_uploads[upload_id])
     if sse_part_err is not None:
@@ -8707,21 +9036,11 @@ def _complete_multipart_upload(
     if cached is not None and cached.get("key") == key:
         return cached["response"]
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     # An SSE-C upload's completion must present the create-time key again, as
     # every part did; a plain upload's completion must present none. (The
@@ -8765,7 +9084,14 @@ def _complete_multipart_upload(
             if pn_text is not None:
                 ordered_parts.append((int(pn_text), etag_text, part_checksums))
 
-    ordered_parts.sort(key=lambda x: x[0])
+    if not ordered_parts:
+        return _error("MalformedXML", _MALFORMED_XML, 400, f"/{bucket_name}/{key}")
+    if any(b[0] <= a[0] for a, b in zip(ordered_parts, ordered_parts[1:])):
+        return _error(
+            "InvalidPartOrder",
+            "The list of parts was not in ascending order. The parts list must be specified in order by part number.",
+            400,
+        )
 
     md5_digests = b""
     # Part bodies are joined once at the end: appending each 5 MB+ part to a
@@ -8783,7 +9109,7 @@ def _complete_multipart_upload(
                 400,
             )
         stored = upload["parts"][pn]
-        if req_etag and req_etag.strip('"') != stored["etag"].strip('"'):
+        if not req_etag or req_etag.strip('"') != stored["etag"].strip('"'):
             return _error(
                 "InvalidPart",
                 "One or more of the specified parts could not be found. "
@@ -8864,7 +9190,8 @@ def _complete_multipart_upload(
 
     resp_headers = {"Content-Type": "application/xml"}
     resp_headers.update(_stored_sse_headers(obj))
-    _maybe_replicate(bucket_name, key, obj, combined)
+    tags = upload.get("tags")
+    _maybe_replicate(bucket_name, key, obj, combined, tags)
     version_id = _record_object_version(bucket_name, key, prior_obj, obj, combined)
     if version_id:
         resp_headers["x-amz-version-id"] = version_id
@@ -8877,8 +9204,19 @@ def _complete_multipart_upload(
         version_id=version_id,
     )
 
+    # The tags given at create time replace any the overwritten object had.
+    if tags:
+        _object_tags[(bucket_name, key, obj.get("version_id"))] = dict(tags)
+        if obj.get("_replica"):
+            dest_name, replica_version, dest_account = obj["_replica"]
+            with _in_account(dest_account):
+                _object_tags[(dest_name, key, replica_version)] = dict(tags)
+                _persist_version_state(dest_name, key, _buckets[dest_name])
+    else:
+        _object_tags.pop((bucket_name, key, obj.get("version_id")), None)
+
     # Persist only after the versioning block: the .meta.json sidecar must
-    # carry the version_id assigned above (#1058).
+    # carry the version_id assigned above (#1058), and the tags.
     if S3_PERSIST:
         _persist_object(bucket_name, key, obj)
 
@@ -8914,21 +9252,11 @@ def _abort_multipart_upload(bucket_name: str, key: str, query_params: dict):
 
     upload_id = _qp(query_params, "uploadId")
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     del _multipart_uploads[upload_id]
     return 204, {}, b""
@@ -9000,21 +9328,11 @@ def _list_parts(bucket_name: str, key: str, query_params: dict):
 
     upload_id = _qp(query_params, "uploadId")
     if upload_id not in _multipart_uploads:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     upload = _multipart_uploads[upload_id]
     if upload["bucket"] != bucket_name or upload["key"] != key:
-        return _error(
-            "NoSuchUpload",
-            "The specified multipart upload does not exist.",
-            404,
-            f"/{bucket_name}/{key}",
-        )
+        return _no_such_upload(upload_id)
 
     max_parts = int(_qp(query_params, "max-parts", "1000"))
     part_marker = int(_qp(query_params, "part-number-marker", "0"))
@@ -9236,13 +9554,18 @@ def _persist_version_state(bucket_name: str, key: str, bucket: dict):
         _delete_persisted_object(bucket_name, key)
 
 
+def _key_sidecar_stores():
+    return (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations),
+            ("retention", _object_retention), ("legal_hold", _object_legal_hold))
+
+
 def _key_history_meta(bucket_name: str, key: str) -> dict:
     versions = _object_versions.get((bucket_name, key)) or []
     extra = {}
     if versions:
         extra["versions"] = [{k: v for k, v in e.items() if k != "data"} for e in versions]
     vids = [None] + [v["version_id"] for v in versions if v["version_id"] != "null" and not v.get("is_delete_marker")]
-    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+    for field, store in _key_sidecar_stores():
         found = {vid or "null": store.get((bucket_name, key, vid)) for vid in vids}
         found = {vid: value for vid, value in found.items() if value is not None}
         if found:
@@ -9464,7 +9787,7 @@ def _load_persisted_bucket(account_id, bucket_name, bucket_path):
         }
         if meta.get("version_id"):
             bucket["objects"][key]["version_id"] = meta["version_id"]
-        if "versions" in meta or "tags" in meta or "acl" in meta:
+        if "versions" in meta or any(field in meta for field, _ in _key_sidecar_stores()):
             _load_persisted_history(account_id, bucket, bucket_name, key, meta)
         elif meta.get("version_id"):
             vkey = (bucket_name, key)
@@ -9567,7 +9890,7 @@ def _load_persisted_history(account_id, bucket, bucket_name, key, meta):
     live = {v["version_id"] for v in versions if not v.get("is_delete_marker")}
     if current is not None and not current.get("version_id"):
         live.add("null")
-    for field, store in (("tags", _object_tags), ("acl", _object_acl), ("annotations", _object_annotations)):
+    for field, store in _key_sidecar_stores():
         for vid, value in (meta.get(field) or {}).items():
             if vid in live:
                 store._data[(account_id, (bucket_name, key, None if vid == "null" else vid))] = value
@@ -9774,16 +10097,27 @@ def _mrap_describe(token_arn: str) -> tuple:
 
 
 def _mrap_list(query_params: dict) -> tuple:
-    records = sorted(_mraps.values(), key=lambda r: (r["CreatedAt"], r["Name"]))
-    start = int(_qp(query_params, "nextToken", "0") or "0")
+    # The token names the last access point returned, not a position, so a create or delete between pages skips
+    # nothing.
+    records = sorted(_mraps.values(), key=lambda r: (str(r["CreatedAt"]), r["Name"]))
+    token = _qp(query_params, "nextToken", "")
+    if token:
+        try:
+            after = tuple(json.loads(base64.urlsafe_b64decode(token.encode())))
+        except (ValueError, TypeError):
+            after = None
+        if after is not None:
+            records = [r for r in records if (str(r["CreatedAt"]), r["Name"]) > after]
     max_results = int(_qp(query_params, "maxResults", "1000") or "1000")
-    page = records[start:start + max_results]
+    page = records[:max_results]
     out = Element("ListMultiRegionAccessPointsResult", xmlns=S3CONTROL_NS)
     aps = SubElement(out, "AccessPoints")
     for record in page:
         _mrap_report_xml(aps, record)
-    if start + max_results < len(records):
-        SubElement(out, "NextToken").text = str(start + max_results)
+    if page and len(records) > max_results:
+        last = page[-1]
+        SubElement(out, "NextToken").text = base64.urlsafe_b64encode(
+            json.dumps([str(last["CreatedAt"]), last["Name"]]).encode()).decode()
     return _s3control_response(out)
 
 
@@ -10144,6 +10478,56 @@ def handle_access_point_control(method: str, path: str, headers: dict, body: byt
 
 
 # ---------------------------------------------------------------------------
+# S3 Control: account-level public access block
+# ---------------------------------------------------------------------------
+_ACCOUNT_PAB_PATH = "/v20180820/configuration/publicAccessBlock"
+
+_ACCOUNT_PAB_ACTIONS = {
+    "PUT": "s3:PutAccountPublicAccessBlock",
+    "GET": "s3:GetAccountPublicAccessBlock",
+    "DELETE": "s3:PutAccountPublicAccessBlock",
+}
+
+_ACCOUNT_PAB_FIELDS = ("BlockPublicAcls", "IgnorePublicAcls", "BlockPublicPolicy", "RestrictPublicBuckets")
+
+
+def is_account_public_access_block_path(path: str) -> bool:
+    return path.rstrip("/") == _ACCOUNT_PAB_PATH
+
+
+def handle_account_public_access_block(method: str, path: str, body: bytes) -> tuple:
+    """The request account's public access block."""
+    if method == "PUT":
+        root = None
+        if body:
+            try:
+                raw = body.decode("utf-8", errors="replace") if isinstance(body, bytes) else body
+                root = fromstring(raw)
+            except ParseError:
+                root = None
+        _account_public_access_block["config"] = {
+            field: _child_text(root, field, "false").lower() == "true" for field in _ACCOUNT_PAB_FIELDS}
+        return 200, {}, b""
+    if method == "GET":
+        cfg = _account_public_access_block.get("config")
+        if cfg is None:
+            return s3control_error(
+                "NoSuchPublicAccessBlockConfiguration",
+                "The public access block configuration was not found", 404,
+                {"AccountId": get_account_id()})
+        # The real wire xmlns is http://, not https:// (observed us-east-2 2026-10-30).
+        out = Element("PublicAccessBlockConfiguration", xmlns="http://awss3control.amazonaws.com/doc/2018-08-20/")
+        for field in _ACCOUNT_PAB_FIELDS:
+            SubElement(out, field).text = str(bool(cfg.get(field))).lower()
+        return _s3control_response(out)
+    if method == "DELETE":
+        _account_public_access_block.pop("config", None)
+        return 204, {}, b""
+    return s3control_error("MethodNotAllowed", "The specified method is not allowed against this resource.", 405,
+                           {"Method": method, "ResourceType": "ACCOUNT_PUBLIC_ACCESS_BLOCK"})
+
+
+# ---------------------------------------------------------------------------
 # S3 Control: Object Lambda Access Points
 # ---------------------------------------------------------------------------
 
@@ -10403,6 +10787,7 @@ def reset():
         _mrap_operations,
         _access_points,
         _object_lambda_access_points,
+        _account_public_access_block,
         _olap_requests,
     ):
         d.clear()
