@@ -233,6 +233,7 @@ from ministack.core.iam_evaluator import (
 from ministack.core.persistence import PERSIST_STATE, load_state, save_all
 from ministack.core.responses import (
     _12_DIGIT_RE,
+    _request_account_id,
     fix_error_content_type,
     fix_success_content_type,
     set_request_account_id,
@@ -1046,6 +1047,8 @@ async def _handle_cognito_get_request(method: str, path: str, headers: dict, que
         return _get_module("cognito").handle_oauth2_userinfo(method, path, headers, b"", query_params)
     if path == "/logout" and method == "GET":
         return _get_module("cognito").handle_logout(method, path, headers, query_params)
+    if path == "/forgotPassword" and method == "GET":
+        return _get_module("cognito").handle_forgot_password_page(method, path, headers, query_params)
     return None
 
 
@@ -1379,6 +1382,10 @@ async def _handle_pre_body_request(method: str, path: str, headers: dict, query_
     if response is not None:
         return response
 
+    response = _handle_elb_public_key_request(method, path, host)
+    if response is not None:
+        return response
+
     return await _handle_admin_reset(path, method, query_params)
 
 
@@ -1398,6 +1405,34 @@ def _handle_elasticache_ca_request(method: str, path: str):
             json.dumps({"message": str(e)}).encode(),
         )
     return (200, {"Content-Type": "application/x-pem-file"}, cert_pem.encode())
+
+
+_ELB_PUBLIC_KEYS_PREFIX = "/_ministack/elb/public-keys/"
+_ELB_PUBLIC_KEYS_HOST_RE = re.compile(r"^public-keys\.auth\.elb\.[a-z0-9-]+\.amazonaws\.com(?::\d+)?$", re.IGNORECASE)
+
+
+def _handle_elb_public_key_request(method: str, path: str, host: str):
+    """`GET public-keys.auth.elb.<region>.amazonaws.com/<kid>` (or
+    `/_ministack/elb/public-keys/<kid>`) returns the PEM key that verifies
+    x-amzn-oidc-data; an unknown kid gets AWS's S3 AccessDenied."""
+    if method != "GET":
+        return None
+    if _ELB_PUBLIC_KEYS_HOST_RE.match(host):
+        kid = path[1:]
+    elif path.startswith(_ELB_PUBLIC_KEYS_PREFIX):
+        kid = path[len(_ELB_PUBLIC_KEYS_PREFIX):]
+    else:
+        return None
+    from ministack.services import alb
+
+    public_key_pem = alb.oidc_public_key_pem(kid)
+    if public_key_pem is None:
+        return (
+            403,
+            {"Content-Type": "application/xml"},
+            b'<?xml version="1.0" encoding="UTF-8"?>\n<Error><Code>AccessDenied</Code><Message>Access Denied</Message></Error>',
+        )
+    return (200, {"Content-Type": "application/x-pem-file"}, public_key_pem.encode())
 
 
 def _handle_rds_ca_request(method: str, path: str):
@@ -1671,6 +1706,23 @@ async def _handle_s3_control_request(path: str, method: str, body: bytes, query_
             or handler(method, path, headers, body, query_params)
         )
         return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
+    if s3.is_account_public_access_block_path(path):
+        headers = headers or {}
+        if AUTH:
+            action = s3._ACCOUNT_PAB_ACTIONS.get(method)
+            if action:
+                denied = _enforce_data_plane("s3", action, headers, query_params, request_id)
+                if denied:
+                    return denied
+            elif failure := _authenticate_only("s3", headers, query_params, request_id):
+                return failure
+        status, resp_headers, resp_body = (
+            (AUTH and s3.s3control_account_error(headers))
+            or s3.handle_account_public_access_block(method, path, body)
+        )
+        return status, {**resp_headers, "x-amzn-requestid": request_id}, resp_body
+
     if failure := _authenticate_only("s3", headers, query_params, request_id):
         return failure
 
@@ -1906,7 +1958,8 @@ def _execute_api_authorization_type(api_id: str, stage: str, method: str, execut
 
 def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str,
                          headers: dict, query_params: dict,
-                         iam_action: str = "execute-api:Invoke"):
+                         iam_action: str = "execute-api:Invoke",
+                         caller_account: str | None = None):
     """Authorize an execute-api call against its own ARN.
 
     ``arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>``,
@@ -1939,15 +1992,26 @@ def _enforce_execute_api(api_id: str, stage: str, method: str, execute_path: str
         refused = foreign_authorization_failure(headers) if apigw_v1.find_api_scope(api_id) is not None else None
         if refused:
             return apigw_v1.authentication_error_response(api_id, stage, AuthError(*refused), headers, query_params)
-    return _enforce_data_plane(
-        "apigateway", iam_action, headers, query_params, "",
-        resource_arn=execute_api_arn(
-            extract_region(headers, query_params), get_account_id(),
-            api_id, stage, method, execute_path,
-        ),
-        auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
-            api_id, stage, error, headers, query_params),
+    # The ARN names the API's owner; the caller is authenticated in its own account.
+    resource_arn = execute_api_arn(
+        extract_region(headers, query_params), get_account_id(),
+        api_id, stage, method, execute_path,
     )
+    owner_scope = _get_module("apigateway_v1").find_api_scope(api_id) if caller_account else None
+    token = _request_account_id.set(caller_account) if caller_account else None
+    try:
+        return _enforce_data_plane(
+            "apigateway", iam_action, headers, query_params, "",
+            resource_arn=resource_arn,
+            auth_error_response=lambda error: _get_module("apigateway_v1").authentication_error_response(
+                api_id, stage, error, headers, query_params),
+            denied_response=(lambda denied: _get_module("apigateway_v1").cross_account_denial_response(
+                api_id, stage, denied, headers, query_params, owner_scope))
+            if owner_scope else None,
+        )
+    finally:
+        if token is not None:
+            _request_account_id.reset(token)
 
 
 def _resolve_stage_and_path(api_id: str, tentative_stage: str, execute_path: str) -> tuple[str, str]:
@@ -2016,11 +2080,12 @@ def _resolve_cloudfront_alias_request(host: str):
 
 async def _serve_cloudfront_distribution(
     dist, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     try:
         return await _get_module("cloudfront").handle_viewer_request(
             dist, method, path, raw_path, raw_query_string, headers, body, query_params, client_ip,
+            http_version=http_version,
         )
     except Exception as e:
         logger.exception("Error in CloudFront data-plane dispatch: %s", e)
@@ -2029,7 +2094,7 @@ async def _serve_cloudfront_distribution(
 
 async def _handle_cloudfront_dataplane_request(
     host: str, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     """Serve a CloudFront distribution's viewer traffic, matched by its ``<label>.cloudfront.net`` Host."""
     label = _parse_cloudfront_dataplane_host(host)
@@ -2037,12 +2102,12 @@ async def _handle_cloudfront_dataplane_request(
     if dist is None:
         return None
     return await _serve_cloudfront_distribution(
-        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
 
 
 async def _handle_cloudfront_alias_request(
     host: str, path: str, raw_path: str, raw_query_string: str, method: str,
-    headers: dict, body: bytes, query_params: dict, client_ip: str,
+    headers: dict, body: bytes, query_params: dict, client_ip: str, http_version: str = "1.1",
 ):
     """Serve a request whose Host is a distribution's alternate domain name. Runs after every other Host-claiming
     handler: on AWS DNS sends those hosts to their own service, here the Host is the only signal."""
@@ -2054,7 +2119,21 @@ async def _handle_cloudfront_alias_request(
     if dist is None:
         return None
     return await _serve_cloudfront_distribution(
-        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip)
+        dist, path, raw_path, raw_query_string, method, headers, body, query_params, client_ip, http_version)
+
+
+def _invoke_as_api_owner(api_id: str) -> str | None:
+    """Run an API another account owns as its owner; returns the caller's account, or None."""
+    apigw_v1 = _get_module("apigateway_v1")
+    apigw_v2 = _get_module("apigateway")
+    if apigw_v1.find_api_scope(api_id) is not None or apigw_v2.find_api_scope(api_id) is not None:
+        return None
+    owner = apigw_v1.find_api_owner(api_id) or apigw_v2.find_api_owner(api_id)
+    if not owner:
+        return None
+    caller_account = _request_account_id.get()
+    _request_account_id.set(owner)
+    return caller_account
 
 
 async def _handle_execute_api_request(
@@ -2081,6 +2160,7 @@ async def _handle_execute_api_request(
     if parsed is None:
         return None
     api_id, tentative_stage, execute_path = parsed
+    caller_account = _invoke_as_api_owner(api_id)
 
     # WebSocket @connections management API — /{stage}/@connections/{id}.
     # The @connections prefix is authoritative; skip $default resolution.
@@ -2106,6 +2186,7 @@ async def _handle_execute_api_request(
     denied = _enforce_execute_api(
         api_id, stage, method, execute_path, headers, query_params,
         iam_action="execute-api:ManageConnections" if connections else "execute-api:Invoke",
+        caller_account=caller_account,
     )
     if denied:
         return denied
@@ -2241,12 +2322,13 @@ async def _handle_alb_request(
         return None
 
     alb_module = _get_module("alb")
-    load_balancer = alb_module.find_lb_for_host(host)
+    load_balancer = None
     dispatch_path = path
     # Instance and IP targets get the path as the client sent it, percent-encoding included.
     raw_dispatch_path = raw_path
 
-    if load_balancer is None and path.startswith(_ALB_PATH_PREFIX):
+    # /_alb/<name>/ names the load balancer dialed; Host then only feeds its listener rules.
+    if path.startswith(_ALB_PATH_PREFIX):
         path_parts = path[len(_ALB_PATH_PREFIX) :].split("/", 1)
         load_balancer = alb_module._find_lb_by_name(path_parts[0])
         if load_balancer:
@@ -2255,6 +2337,8 @@ async def _handle_alb_request(
                 raw_parts = raw_path[len(_ALB_PATH_PREFIX) :].split("/", 1)
                 raw_dispatch_path = "/" + raw_parts[1] if len(raw_parts) > 1 else "/"
 
+    if load_balancer is None:
+        load_balancer = alb_module.find_lb_for_host(host)
     if load_balancer is None:
         return None
 
@@ -2386,8 +2470,9 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         return await s3_object_lambda.handle_request(record, olap_region, method, path.lstrip("/"), headers, body,
                                                      query_params, url)
     if ap_match and s3.signed_service(headers, query_params) in ("s3", None):
-        target = s3.resolve_access_point_host(ap_match.group("name"), ap_match.group("account"),
-                                              s3._signed_region(headers, query_params))
+        target = s3.resolve_access_point_host(
+            ap_match.group("name"), ap_match.group("account"), s3._signed_region(headers, query_params),
+            allow_foreign=s3.is_foreign_access_point_put(method, path.lstrip("/"), headers, query_params))
         if target is not None:
             ap_bucket, ap_region, ap_error = target
             if ap_error:
@@ -2423,6 +2508,11 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
     if AUTH:
         object_error = (None if method in {"HEAD", "DELETE"} and access_point_region is not None else
                         _get_module("s3").validate_object_request(method, vhost_path, headers, query_params))
+        if object_error is None:
+            # An access point ARN host is validated as its alias, which names another account's access point.
+            write_path = (vhost_path if access_point_alias is None
+                          else f"/{access_point_alias}{vhost_path[len(bucket) + 1:]}")
+            object_error = _get_module("s3").validate_write_request(method, write_path, headers, query_params)
         if object_error is not None:
             return object_error
         from ministack.core.iam_actions import (
@@ -2441,10 +2531,12 @@ async def _handle_s3_vhost_request(host: str, path: str, method: str, headers: d
         if s3_action:
             s3_resource = extract_resource_arn("s3", method, iam_path, s3_headers, body, query_params, "", "")
             service_context = s3_service_context(f"s3:{s3_action}", query_params, iam_path, s3_headers)
-            for resource, keys in s3_access_point_resources(s3_resource):
+            for resource, keys in s3_access_point_resources(s3_resource, f"s3:{s3_action}"):
                 denied = _enforce_data_plane(
                     "s3", f"s3:{s3_action}", headers, query_params, "", resource_arn=resource,
                     service_context={**service_context, **keys},
+                    denied_response=(lambda result, keys=keys, resource=resource: _s3_foreign_denied(
+                        keys, f"s3:{s3_action}", result, resource, headers, query_params)),
                 )
                 if denied:
                     return denied
@@ -2541,6 +2633,7 @@ def _authenticate_only(service: str, headers: dict, query_params: dict, request_
 def _enforce_data_plane(
     service: str, iam_action: str, headers: dict, query_params: dict, request_id: str, resource_arn: str = "*",
     service_context: dict | None = None, auth_error_response=None, named_resource: str = "",
+    denied_response=None,
 ):
     """Enforce IAM auth on a data-plane path. Returns error tuple or None.
 
@@ -2549,6 +2642,7 @@ def _enforce_data_plane(
     handler has to pass them, because it knows the resource the router does not.
     ``named_resource`` is the resource an identity-policy denial names, in the
     error Content-Type of the service, for the services that word it so.
+    ``denied_response(result)`` may word a policy denial; None keeps the default.
     """
     if not AUTH:
         return None
@@ -2562,6 +2656,9 @@ def _enforce_data_plane(
         if isinstance(denied, AuthError):
             response = auth_error_response(denied) if auth_error_response else None
             return response or _credential_failure(service, iam_action, request_id, denied, headers)
+        response = denied_response(denied) if denied_response else None
+        if response:
+            return response
         explicit = denied.decision == "Deny"
         message = ""
         if named_resource and not (explicit and denied.resource_policy_arn):
@@ -2573,6 +2670,17 @@ def _enforce_data_plane(
             fix_error_content_type(service, response[0], response[1])
         return response
     return None
+
+
+def _s3_foreign_denied(keys: dict, iam_action: str, denied, resource: str, headers: dict, query_params: dict):
+    """The answer to a denial in a step of a PutObject through another account's access point, or None."""
+    from ministack.core.iam_actions import access_denied_response, s3_foreign_denial_message
+
+    message = s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied, resource)
+    if not message:
+        return None
+    return access_denied_response("s3", iam_action, denied.principal_arn, "", headers=headers, message=message,
+                                  explicit_deny=denied.decision == "Deny")
 
 
 def _enforce_ses_v2(method: str, path: str, headers: dict, body: bytes, query_params: dict, request_id: str):
@@ -2663,6 +2771,7 @@ async def _handle_special_data_plane_request(
     raw_path: str | None = None,
     raw_query_string: str = "",
     client_ip: str = "127.0.0.1",
+    http_version: str = "1.1",
 ):
     """Handle special-case service entrypoints before the generic router."""
     # S3 Object Lambda's WriteGetObjectResponse, on any host: its modeled host
@@ -2711,7 +2820,7 @@ async def _handle_special_data_plane_request(
     host = headers.get("host", "")
     if response := await _handle_cloudfront_dataplane_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
-        headers, body, query_params, client_ip,
+        headers, body, query_params, client_ip, http_version,
     ):
         # A distribution adds its own headers (Via, X-Amz-Cf-Id, X-Amz-Cf-Pop, X-Cache), not an API's request ids.
         return response
@@ -2742,7 +2851,7 @@ async def _handle_special_data_plane_request(
     # A distribution's alternate domain name yields to every service that claims the Host.
     return await _handle_cloudfront_alias_request(
         host, path, raw_path if raw_path is not None else path, raw_query_string, method,
-        headers, body, query_params, client_ip,
+        headers, body, query_params, client_ip, http_version,
     )
 
 
@@ -3015,6 +3124,8 @@ async def _dispatch_service_request(
 
     if AUTH and service == "s3":
         object_error = _get_module("s3").validate_object_request(method, path, headers, query_params)
+        if object_error is None:
+            object_error = _get_module("s3").validate_write_request(method, path, headers, query_params)
         if object_error is not None:
             return object_error
 
@@ -3034,8 +3145,10 @@ async def _dispatch_service_request(
             extract_resource_arn,
             iot_resource_arns,
             logs_service_context,
+            request_field_context,
             request_tag_context,
             s3_access_point_resources,
+            s3_foreign_denial_message,
             s3_service_context,
             verified_access_resource_arns,
         )
@@ -3044,6 +3157,7 @@ async def _dispatch_service_request(
 
         pin_request_caller(headers, query_params)
         iam_action = extract_iam_action(service, method, path, headers, body, routing_params)
+        denial_message = ""
         if service == "ses" and (path.startswith("/v2/") or "sesv2" in headers.get("x-amz-target", "").lower()):
             # SES v2 also answers on paths without /v2/email when the target header names it: authorize the call
             # as the /v2/email operation it performs, never as an action the target header names.
@@ -3082,6 +3196,7 @@ async def _dispatch_service_request(
                     iam_action.split(":", 1)[1], body, resource_arn, region, get_account_id()
                 )
             service_context = {**request_tag_context(service, iam_action, body, routing_params),
+                               **request_field_context(service, iam_action, body, routing_params, region),
                                **(service_context or {})}
             # A DynamoDB transaction is not itself an IAM action: each item is
             # authorized as the single-item action it performs, on its table.
@@ -3103,13 +3218,16 @@ async def _dispatch_service_request(
                         break
             else:
                 # Through an S3 access point alias the check is made on the access point and on its bucket.
-                for checked_arn, keys in (s3_access_point_resources(resource_arn) if service == "s3"
+                for checked_arn, keys in (s3_access_point_resources(resource_arn, iam_action) if service == "s3"
                                           else [(resource_arn, {})]):
                     denied = enforce(
                         access_key, iam_action, service, region,
                         resource_arn=checked_arn, service_context={**service_context, **keys},
                     )
                     if denied:
+                        denial_message = (s3_foreign_denial_message(keys, iam_action, denied.principal_arn, denied,
+                                                                    checked_arn)
+                                          if service == "s3" and not isinstance(denied, AuthError) else "")
                         break
             # A malformed Logs tagging ARN fails validation ahead of a policy denial.
             if service == "logs" and logs_validation_error is not None and not isinstance(denied, AuthError):
@@ -3196,7 +3314,7 @@ async def _dispatch_service_request(
                 return access_denied_response(
                     service, iam_action, denied.principal_arn, request_id, headers=headers,
                     resource_arn=resource_arn, explicit_deny=denied.decision == "Deny",
-                    resource_policy_arn=denied.resource_policy_arn,
+                    resource_policy_arn=denied.resource_policy_arn, message=denial_message,
                 )
 
     handler = SERVICE_HANDLERS.get(service)
@@ -3463,6 +3581,7 @@ async def app(scope, receive, send):
         raw_path=scope["raw_path"].decode("ascii") if scope.get("raw_path") else None,
         raw_query_string=query_string,
         client_ip=(scope.get("client") or ("127.0.0.1",))[0],
+        http_version=scope.get("http_version", "1.1"),
     )
     if response is not None and head_path is not None:
         response = _get_module("s3").format_head_response(head_path, headers, response)
@@ -3718,6 +3837,10 @@ def _stop_docker_containers(include_unlabelled: bool = False):
     if client is None:
         return
     container_reaper.reap_all(client, include_unlabelled=include_unlabelled)
+    # *_PERSIST=0 keeps no data across a restart, so that service's named volumes go too.
+    for service, flag in (("rds", "RDS_PERSIST"), ("mwaa", "MWAA_PERSIST"), ("dsql", "DSQL_PERSIST")):
+        if os.environ.get(flag, "0").lower() not in ("1", "true", "yes"):
+            container_reaper.reap_volumes(client, service)
 
 
 def _build_persistence_save_dict():

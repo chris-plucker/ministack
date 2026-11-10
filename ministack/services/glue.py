@@ -35,8 +35,11 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("glue")
@@ -62,6 +65,22 @@ GLUE_DOCKER_IMAGE_OVERRIDE = os.environ.get("GLUE_DOCKER_IMAGE", "")
 
 _docker = None
 _ministack_network = None
+
+
+_DOCUMENT_MEMBERS = frozenset(('Type', 'InitialDefault', 'WriteDefault', 'Records'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _get_docker():
@@ -126,6 +145,7 @@ _workflow_runs = AccountRegionScopedDict()  # workflow_name -> [run, ...]
 _user_defined_functions = AccountRegionScopedDict()  # "db_name/function_name" -> udf dict
 _table_column_statistics = AccountRegionScopedDict()  # "db/table" -> {column_name: stats}
 _partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
+_table_optimizers = AccountRegionScopedDict()  # "db/table" -> {optimizer type: TableOptimizer}
 
 _ALL_STATE = {
     "databases": _databases,
@@ -144,6 +164,7 @@ _ALL_STATE = {
     "workflow_runs": _workflow_runs,
     "user_defined_functions": _user_defined_functions,
     "table_column_statistics": _table_column_statistics,
+    "table_optimizers": _table_optimizers,
     "partition_column_statistics": _partition_column_statistics,
 }
 
@@ -293,6 +314,13 @@ def _handle_request_sync(method, path, headers, body, query_params):
         "GetTables": _get_tables,
         "UpdateTable": _update_table,
         "BatchDeleteTable": _batch_delete_table,
+        # Table optimizers
+        "CreateTableOptimizer": _create_table_optimizer,
+        "GetTableOptimizer": _get_table_optimizer,
+        "UpdateTableOptimizer": _update_table_optimizer,
+        "DeleteTableOptimizer": _delete_table_optimizer,
+        "BatchGetTableOptimizer": _batch_get_table_optimizer,
+        "ListTableOptimizerRuns": _list_table_optimizer_runs,
         # Partitions
         "CreatePartition": _create_partition,
         "DeletePartition": _delete_partition,
@@ -893,6 +921,9 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    for k in ("CreateTableDefaultPermissions", "TargetDatabase", "FederatedDatabase"):
+        if db_input.get(k) is not None:
+            _databases[name][k] = db_input[k]
     if data.get("Tags"):
         _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
@@ -911,6 +942,7 @@ def _delete_database(data):
         _partition_indexes.pop(k, None)
         _table_column_statistics.pop(k, None)
         _partition_column_statistics.pop(k, None)
+        _table_optimizers.pop(k, None)
     return json_response({})
 
 
@@ -931,7 +963,8 @@ def _update_database(data):
     db_input = data.get("DatabaseInput", {})
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
-    safe_keys = {"Description", "LocationUri", "Parameters"}
+    safe_keys = {"Description", "LocationUri", "Parameters", "CreateTableDefaultPermissions", "TargetDatabase",
+                 "FederatedDatabase"}
     for k in safe_keys:
         if k in db_input:
             _databases[name][k] = db_input[k]
@@ -957,7 +990,7 @@ def _create_table(data):
         "Owner": table_input.get("Owner", ""),
         "CreateTime": int(time.time()),
         "UpdateTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
+        "LastAccessTime": table_input.get("LastAccessTime", int(time.time())),
         "StorageDescriptor": table_input.get("StorageDescriptor", {}),
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
@@ -973,6 +1006,9 @@ def _create_table(data):
         # botocore Table output shape.
         "VersionId": "1",
     }
+    for k in ("LastAnalyzedTime", "Retention", "TargetTable", "FederatedTable"):
+        if table_input.get(k) is not None:
+            _tables[key][k] = table_input[k]
     return json_response({})
 
 
@@ -987,6 +1023,7 @@ def _delete_table(data):
     _partition_indexes.pop(key, None)
     _table_column_statistics.pop(key, None)
     _partition_column_statistics.pop(key, None)
+    _table_optimizers.pop(key, None)
     return json_response({})
 
 
@@ -1038,6 +1075,11 @@ def _update_table(data):
         "ViewExpandedText",
         "ViewDefinition",
         "IsMultiDialectView",
+        "LastAccessTime",
+        "LastAnalyzedTime",
+        "Retention",
+        "TargetTable",
+        "FederatedTable",
     }
     for k in safe_keys:
         if k in table_input:
@@ -1069,7 +1111,206 @@ def _batch_delete_table(data):
             _partition_indexes.pop(key, None)
             _table_column_statistics.pop(key, None)
             _partition_column_statistics.pop(key, None)
+            _table_optimizers.pop(key, None)
     return json_response({"Errors": errors})
+
+
+# ---- Table optimizers (control plane only: optimizers never run) ----
+# Shapes, defaults and messages from a real-AWS capture (eu-west-2, 2026-11-01).
+
+
+def _optimizer_config(optimizer_type, config):
+    """The stored configuration: what the call sent, with the defaults AWS fills in for its type."""
+    config = copy.deepcopy(config or {})
+    if optimizer_type == "compaction":
+        block = config.setdefault("compactionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("strategy", "binpack")
+    elif optimizer_type == "retention":
+        block = config.setdefault("retentionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("cleanExpiredFiles", True)
+        block.setdefault("runRateInHours", 24)
+    elif optimizer_type == "orphan_file_deletion":
+        block = config.setdefault("orphanFileDeletionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("runRateInHours", 24)
+    return config
+
+
+def _optimizer_table(data):
+    """(key, table, optimizers) for the call's table, or an error response when the table doesn't exist."""
+    key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
+    table = _tables.get(key)
+    if table is None:
+        return None, _optimizer_error("EntityNotFoundException", _entity_not_found_message(), 404)
+    return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _optimizer_error(code, message, glue_status):
+    """AWS ends every table optimizer error with Glue's service suffix (real AWS capture)."""
+    return error_response_json(code, f"{message} (Service: glue; Status Code: {glue_status}; Error Code: {code}; "
+                                     f"Request ID: {new_uuid()}; Proxy: null)", 400)
+
+
+def _entity_not_found_message():
+    return (f"Entity Not Found (Service: AmazonDataCatalog; Status Code: 400; Error Code: EntityNotFoundException; "
+            f"Request ID: {new_uuid()}; Proxy: null)")
+
+
+def _run_rate_error(config):
+    """Retention and orphan file deletion run every 3 to 168 hours."""
+    for block in ("retentionConfiguration", "orphanFileDeletionConfiguration"):
+        rate = (((config or {}).get(block) or {}).get("icebergConfiguration") or {}).get("runRateInHours")
+        if rate is not None and not 3 <= rate <= 168:
+            return _optimizer_error("InvalidInputException", "Request Validation Failed with error: "
+                                    "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
+    return None
+
+
+def _optimizer_response(optimizer_type, config):
+    return {"type": optimizer_type, "configuration": config, "configurationSource": "table"}
+
+
+def _no_optimizer(optimizer_type, table_name):
+    return _optimizer_error("EntityNotFoundException",
+                            f"No optimizer of type {optimizer_type} found for the table: {table_name}", 404)
+
+
+def _role_refusal(table, role_arn):
+    """Under AUTH=true, the optimizer role must be able to read the table and reach its S3 location."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _gather_role_policies, evaluate
+
+    account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else get_account_id()
+    policies = _gather_role_policies(role_arn.rsplit("/", 1)[-1], account)
+
+    def allowed(action, resource):
+        ctx = EvalContext(principal_arn=role_arn, principal_type="AssumedRole", principal_account=account,
+                          action=action, resource_arn=resource, region=get_region())
+        return evaluate(ctx, policies).decision == "Allow"
+
+    table_arn = f"arn:aws:glue:{get_region()}:{get_account_id()}:table/{table['DatabaseName']}/{table['Name']}"
+    if not allowed("glue:GetTable", table_arn):
+        return _optimizer_error("AccessDeniedException", f"The provided IAM Role: {role_arn} does not have the "
+                                "proper IAM permissions to call Glue APIs. Please update the role's IAM "
+                                "permissions to allow access to the table", 403)
+    location = (table.get("StorageDescriptor") or {}).get("Location", "")
+    bucket = location.split("://", 1)[-1].split("/", 1)[0]
+    if not (allowed("s3:ListBucket", f"arn:aws:s3:::{bucket}")
+            or any(allowed(f"s3:{a}", f"arn:aws:s3:::{bucket}/*") for a in ("GetObject", "PutObject", "DeleteObject"))):
+        return _optimizer_error("AccessDeniedException", "Access denied", 403)
+    return None
+
+
+def _sort_order_missing(table):
+    metadata = _iceberg_fetch_metadata((table.get("Parameters") or {}).get("metadata_location")) or {}
+    default_id = metadata.get("default-sort-order-id", 0)
+    order = next((o for o in metadata.get("sort-orders", []) if o.get("order-id") == default_id), {})
+    return not order.get("fields")
+
+
+def _create_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type, name = data.get("Type"), data.get("TableName")
+    config = data.get("TableOptimizerConfiguration") or {}
+    # Order as captured on AWS: the table's location, the run rate, an existing optimizer, the role, the sort order.
+    if not (table.get("StorageDescriptor") or {}).get("Location"):
+        return _optimizer_error("InvalidInputException", "Glue table storage warehouse location is null", 400)
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return _optimizer_error("InvalidInputException", "Glue table metadata filepath is null", 400)
+    rate_error = _run_rate_error(config)
+    if rate_error:
+        return rate_error
+    if optimizer_type in optimizers:
+        return _optimizer_error("AlreadyExistsException",
+                                f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
+    role_error = _role_refusal(table, config.get("roleArn") or "")
+    if role_error:
+        return role_error
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: _optimizer_config(
+        optimizer_type, data.get("TableOptimizerConfiguration"))}
+    return json_response({})
+
+
+def _get_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    _key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+
+
+def _update_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    config = _optimizer_config(optimizer_type, data.get("TableOptimizerConfiguration"))
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: config}  # replaces it: fields left out are dropped
+    return json_response({})
+
+
+def _delete_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _optimizer_error("EntityNotFoundException",
+                                f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
+                                404)
+    _table_optimizers[key] = {t: c for t, c in optimizers.items() if t != optimizer_type}
+    return json_response({})
+
+
+def _batch_get_table_optimizer(data):
+    found, failures = [], []
+    for entry in data.get("Entries") or []:
+        catalog_id = entry.get("catalogId") or get_account_id()
+        db_name, name, optimizer_type = entry.get("databaseName"), entry.get("tableName"), entry.get("type")
+        table = _tables.get(f"{db_name}/{name}")
+        optimizers = _table_optimizers.get(f"{db_name}/{name}") or {}
+        ids = {"catalogId": catalog_id, "databaseName": db_name, "tableName": name}
+        if table is None:
+            error = ("EntityNotFoundException", _entity_not_found_message())
+        elif not (table.get("Parameters") or {}).get("metadata_location"):
+            error = ("InvalidInputException", "Request Validation Failed: Unsupported Table type")
+        elif optimizer_type not in optimizers:
+            error = ("EntityNotFoundException", f"No optimizer of type {optimizer_type} found for the table: {name}")
+        else:
+            found.append({**ids, "tableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+            continue
+        failures.append({"error": {"ErrorCode": error[0], "ErrorMessage": error[1]}, **ids, "type": optimizer_type})
+    return json_response({"TableOptimizers": found, "Failures": failures})
+
+
+def _list_table_optimizer_runs(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    if data.get("Type") not in found[2]:
+        return _no_optimizer(data.get("Type"), data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizerRuns": []})
 
 
 # ---- Partitions ----
@@ -1094,7 +1335,7 @@ def _create_partition(data):
             "DatabaseName": db_name,
             "TableName": table_name,
             "CreationTime": int(time.time()),
-            "LastAccessTime": int(time.time()),
+            "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
             "CatalogId": get_account_id(),
         }
     )
@@ -1215,7 +1456,7 @@ def _batch_update_partition(data):
                 "DatabaseName": db_name,
                 "TableName": table_name,
                 "CreationTime": creation_time,
-                "LastAccessTime": int(time.time()),
+                "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
                 "CatalogId": get_account_id(),
             }
         )
@@ -1459,6 +1700,8 @@ def _create_crawler(data):
         "Configuration": data.get("Configuration", ""),
         "CrawlerSecurityConfiguration": data.get("CrawlerSecurityConfiguration", ""),
     }
+    if data.get("LakeFormationConfiguration") is not None:
+        _crawlers[name]["LakeFormationConfiguration"] = data["LakeFormationConfiguration"]
     return json_response({})
 
 
@@ -1498,6 +1741,7 @@ def _update_crawler(data):
         "SchemaChangePolicy",
         "RecrawlPolicy",
         "LineageConfiguration",
+        "LakeFormationConfiguration",
         "Configuration",
         "CrawlerSecurityConfiguration",
     }
@@ -1587,6 +1831,21 @@ def _get_crawler_metrics(data):
 # ---- Jobs ----
 
 
+_JOB_OPTIONAL_FIELDS = (
+    "JobRunQueuingEnabled", "LogUri", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+    "NotificationProperty", "CodeGenConfigurationNodes", "ExecutionClass", "SourceControlDetails",
+    "MaintenanceWindow",
+)
+
+
+def _default_job_timeout(glue_version):
+    """2,880 minutes for Glue 4.0 and earlier, 480 for 5.0 and later (botocore CreateJob Timeout)."""
+    try:
+        return 480 if float(glue_version) >= 5.0 else 2880
+    except (TypeError, ValueError):
+        return 2880
+
+
 def _create_job(data):
     name = data.get("Name")
     if not name:
@@ -1602,16 +1861,21 @@ def _create_job(data):
         "NonOverridableArguments": data.get("NonOverridableArguments", {}),
         "Connections": data.get("Connections", {}),
         "MaxRetries": data.get("MaxRetries", 0),
-        "Timeout": data.get("Timeout", 2880),
-        "GlueVersion": data.get("GlueVersion", "3.0"),
-        "NumberOfWorkers": data.get("NumberOfWorkers", 2),
-        "WorkerType": data.get("WorkerType", "G.1X"),
-        "MaxCapacity": data.get("MaxCapacity"),
+        "GlueVersion": data.get("GlueVersion", "5.1"),
+        "JobMode": data.get("JobMode", "SCRIPT"),
+        "ExecutionProperty": data.get("ExecutionProperty") or {"MaxConcurrentRuns": 1},
         "SecurityConfiguration": data.get("SecurityConfiguration", ""),
         "Tags": data.get("Tags", {}),
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    _jobs[name]["Timeout"] = data.get("Timeout", _default_job_timeout(_jobs[name]["GlueVersion"]))
+    for k in _JOB_OPTIONAL_FIELDS:
+        if data.get(k) is not None:
+            _jobs[name][k] = data[k]
+    if ("MaxCapacity" not in _jobs[name] and "WorkerType" not in _jobs[name]
+            and _jobs[name]["Command"].get("Name") == "pythonshell"):
+        _jobs[name]["MaxCapacity"] = 0.0625
     _job_runs[name] = []
     return json_response({"Name": name})
 
@@ -1628,11 +1892,11 @@ def _get_job(data):
     job = _jobs.get(name)
     if not job:
         return error_response_json("EntityNotFoundException", f"Job {name} not found", 400)
-    return json_response({"Job": job})
+    return json_response(to_output_shape("glue", "GetJobResponse", {"Job": job}))
 
 
 def _get_jobs(data):
-    return json_response({"Jobs": list(_jobs.values())})
+    return json_response(to_output_shape("glue", "GetJobsResponse", {"Jobs": list(_jobs.values())}))
 
 
 def _update_job(data):
@@ -1654,6 +1918,16 @@ def _update_job(data):
         "WorkerType",
         "MaxCapacity",
         "SecurityConfiguration",
+        "JobMode",
+        "JobRunQueuingEnabled",
+        "LogUri",
+        "ExecutionProperty",
+        "AllocatedCapacity",
+        "NotificationProperty",
+        "CodeGenConfigurationNodes",
+        "ExecutionClass",
+        "SourceControlDetails",
+        "MaintenanceWindow",
     }
     for k in updatable:
         if k in job_update:
@@ -1734,16 +2008,19 @@ def _start_job_run(data):
         "Arguments": args,
         "ErrorMessage": "",
         "PredecessorRuns": [],
-        "AllocatedCapacity": job.get("MaxCapacity") or job.get("NumberOfWorkers", 2),
         "ExecutionTime": 0,
-        "Timeout": job.get("Timeout", 2880),
-        "MaxCapacity": job.get("MaxCapacity"),
-        "WorkerType": job.get("WorkerType", "G.1X"),
-        "NumberOfWorkers": job.get("NumberOfWorkers", 2),
-        "SecurityConfiguration": job.get("SecurityConfiguration", ""),
-        "GlueVersion": job.get("GlueVersion", "3.0"),
+        "Timeout": data.get("Timeout") or job.get("Timeout", 2880),
+        "SecurityConfiguration": data.get("SecurityConfiguration") or job.get("SecurityConfiguration", ""),
+        "GlueVersion": job.get("GlueVersion", "5.1"),
         "Attempt": 0,
     }
+    if job.get("JobMode"):
+        run["JobMode"] = job["JobMode"]
+    for k in ("JobRunQueuingEnabled", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+              "NotificationProperty", "ExecutionClass", "MaintenanceWindow", "ExecutionRoleSessionPolicy"):
+        value = data.get(k) if data.get(k) is not None else job.get(k)
+        if value is not None:
+            run[k] = value
 
     if job_name not in _job_runs:
         _job_runs[job_name] = []
@@ -1768,12 +2045,13 @@ def _start_job_run(data):
             except Exception:
                 logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
 
+        run_job = {**job, "Timeout": run["Timeout"]}
         if use_docker:
-            _execute_spark_docker(run, job, job_name, script_args, resolved, docker_client)
+            _execute_spark_docker(run, run_job, job_name, script_args, resolved, docker_client)
         elif _is_spark_job(job):
             run["JobRunState"] = "SUCCEEDED"
         elif resolved and resolved.endswith(".py"):
-            _execute_subprocess(run, job, script_args, resolved)
+            _execute_subprocess(run, run_job, script_args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
@@ -2190,6 +2468,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
 
     try:
         container = docker_client.containers.create(**container_kwargs)
+        _live_job_containers.add(getattr(container, "id", None))
         # Copy script into container (avoids Docker-in-Docker volume mount issues)
         import io
         import tarfile
@@ -2211,6 +2490,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
             container.remove(force=True, v=True)
+            _live_job_containers.discard(getattr(container, "id", None))
         except Exception:
             pass
         return
@@ -2239,10 +2519,16 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Container execution error: {e}"[:4000]
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
+        _live_job_containers.discard(getattr(container, "id", None))
         try:
             container.remove(force=True, v=True)
         except Exception:
             pass
+
+
+# Job runs still in progress; any other stopped glue container is the reaper's.
+_live_job_containers: set = set()
+container_reaper.register_live_ids("glue", lambda: set(_live_job_containers) - {None})
 
 
 def _get_job_run(data):
@@ -2410,6 +2696,8 @@ def _create_trigger(data):
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    if data.get("EventBatchingCondition") is not None:
+        _triggers[name]["EventBatchingCondition"] = data["EventBatchingCondition"]
     if data.get("StartOnCreation", False):
         _triggers[name]["State"] = "ACTIVATED"
     if data.get("Tags"):
@@ -2423,7 +2711,7 @@ def _get_trigger(data):
     trigger = _triggers.get(name)
     if not trigger:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
-    return json_response({"Trigger": trigger})
+    return json_response(to_output_shape("glue", "GetTriggerResponse", {"Trigger": trigger}))
 
 
 def _delete_trigger(data):
@@ -2440,12 +2728,12 @@ def _update_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     trigger_update = data.get("TriggerUpdate", {})
-    updatable = {"Schedule", "Predicate", "Actions", "Description"}
+    updatable = {"Schedule", "Predicate", "Actions", "Description", "EventBatchingCondition"}
     for k in updatable:
         if k in trigger_update:
             _triggers[name][k] = trigger_update[k]
     _triggers[name]["LastModifiedOn"] = int(time.time())
-    return json_response({"Trigger": _triggers[name]})
+    return json_response(to_output_shape("glue", "UpdateTriggerResponse", {"Trigger": _triggers[name]}))
 
 
 def _start_trigger(data):
@@ -2482,7 +2770,8 @@ def _batch_get_triggers(data):
     requested = data.get("TriggerNames", [])
     found = [_triggers[n] for n in requested if n in _triggers]
     not_found = [n for n in requested if n not in _triggers]
-    return json_response({"Triggers": found, "TriggersNotFound": not_found})
+    return json_response(to_output_shape("glue", "BatchGetTriggersResponse",
+                                         {"Triggers": found, "TriggersNotFound": not_found}))
 
 
 def _get_triggers(data):
@@ -2494,7 +2783,7 @@ def _get_triggers(data):
             if not any(a.get("JobName") == dependent_job for a in actions):
                 continue
         triggers.append(trigger)
-    return json_response({"Triggers": triggers})
+    return json_response(to_output_shape("glue", "GetTriggersResponse", {"Triggers": triggers}))
 
 
 # ---- Workflows ----
@@ -2572,7 +2861,7 @@ def _start_workflow_run(data):
             "FailedActions": 0,
             "TimeoutActions": 0,
         },
-        "WorkflowRunProperties": dict(_workflows[name].get("DefaultRunProperties", {})),
+        "WorkflowRunProperties": {**_workflows[name].get("DefaultRunProperties", {}), **(data.get("RunProperties") or {})},
     }
     _workflow_runs.setdefault(name, []).append(run)
     return json_response({"RunId": run_id})
@@ -2588,13 +2877,14 @@ def _udf_key(db_name: str, func_name: str) -> str:
 def _udf_record(db_name: str, fn_input: dict) -> dict:
     """Build a UserDefinedFunction record matching the botocore output shape:
     UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
-    OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    FunctionType, OwnerType, CreateTime, ResourceUris, CatalogId }."""
     return {
         "FunctionName": fn_input.get("FunctionName"),
         "DatabaseName": db_name,
         "ClassName": fn_input.get("ClassName"),
         "OwnerName": fn_input.get("OwnerName"),
         "OwnerType": fn_input.get("OwnerType"),
+        **({"FunctionType": fn_input["FunctionType"]} if fn_input.get("FunctionType") else {}),
         "CreateTime": int(time.time()),
         "ResourceUris": fn_input.get("ResourceUris", []),
         "CatalogId": get_account_id(),
@@ -2628,7 +2918,7 @@ def _update_user_defined_function(data):
         )
     fn_input = data.get("FunctionInput") or {}
     existing = _user_defined_functions[key]
-    for field in ("ClassName", "OwnerName", "OwnerType", "ResourceUris"):
+    for field in ("ClassName", "OwnerName", "OwnerType", "FunctionType", "ResourceUris"):
         if field in fn_input:
             existing[field] = fn_input[field]
     # AWS allows renaming the function via FunctionInput.FunctionName.
@@ -2778,6 +3068,7 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+    _table_optimizers.clear()
 
 
 async def handle_request(method, path, headers, body, query_params):
