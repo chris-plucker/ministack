@@ -2269,6 +2269,18 @@ def test_lambda_nodejs_callback_handler(lam):
     assert payload["val"] == 7
 
 
+def test_lambda_nodejs24_refuses_a_callback_handler(lam):
+    """AWS's Node.js 24 runtime refuses a handler that takes a callback (aws-lambda-nodejs-runtime-interface-client,
+    callback-deprecation.ts); Node.js 20 still runs it (test_lambda_nodejs_callback_handler)."""
+    code = "exports.handler = (event, context, cb) => cb(null, { cb: true });"
+    with _nodejs_lambda(lam, code, prefix="lam-node24-cb", runtime="nodejs24.x") as fname:
+        resp, payload = _invoke_lambda_payload(lam, fname)
+        assert resp["FunctionError"] == "Unhandled"
+        assert payload["errorType"] == "Runtime.CallbackHandlerDeprecated"
+        assert payload["errorMessage"].startswith(
+            "ERROR: AWS Lambda has removed support for callback-based function handlers starting with Node.js 24.")
+
+
 def test_lambda_nodejs_fd_write_sync_invoke_succeeds(lam):
     """fs.writeSync(1) logging must not fail the invocation (issue #1093)."""
     code = (
@@ -3309,6 +3321,43 @@ def test_lambda_docker_cp_dir_arcname_creates_subdir_in_existing_parent():
     # Entries must be rooted at "layer_0/..." so extraction into /opt produces /opt/layer_0/...
     assert any(n.startswith("layer_0/python") or n == "layer_0/python/mod.py" for n in names), names
     assert "layer_0" in names or any(n.startswith("layer_0/") for n in names)
+
+
+def test_lambda_docker_cp_releases_tar_buffer():
+    """The tar built for put_archive is released when the copy returns. tarfile
+    keeps a reference cycle to its fileobj (TarInfo._tarfile), so an unclosed
+    buffer stayed in memory until a full garbage collection: the size of the
+    function's unpacked code on every cold start."""
+    import gc
+    import tempfile
+    import tracemalloc
+
+    from ministack.services.lambda_svc import _docker_cp_dir, _docker_cp_file
+
+    class _FakeContainer:
+        def put_archive(self, path, data):
+            data.read()
+
+    with tempfile.TemporaryDirectory() as src_dir:
+        path = os.path.join(src_dir, "code.bin")
+        with open(path, "wb") as f:
+            f.write(os.urandom(4 * 1024 * 1024))
+        started = not tracemalloc.is_tracing()
+        if started:
+            tracemalloc.start()
+        gc_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            base = tracemalloc.get_traced_memory()[0]
+            _docker_cp_dir(_FakeContainer(), src_dir, "/var/task")
+            _docker_cp_file(_FakeContainer(), path, "/etc/code.bin")
+            held = tracemalloc.get_traced_memory()[0] - base
+        finally:
+            if started:
+                tracemalloc.stop()
+            if gc_enabled:
+                gc.enable()
+    assert held < 1024 * 1024, held
 
 
 def test_lambda_pool_kill_function_reaps_all_qualifiers():
@@ -7494,7 +7543,7 @@ def test_route_async_failure_unknown_target_logs_and_returns():
 # ──────────────────── RIE result → function_error classification ────────────
 
 def test_lambda_strict_hard_fails_when_docker_unavailable(monkeypatch):
-    """LAMBDA_STRICT=1 + no Docker → Runtime.DockerUnavailable, NO fallback to warm/local."""
+    """LAMBDA_STRICT=1 + no Docker → ServiceException (the service failed), NO fallback to warm/local."""
     monkeypatch.setattr(lsvc, "LAMBDA_STRICT", True)
     monkeypatch.setattr(lsvc, "_docker_available", False)
     func = {"config": {
@@ -7507,7 +7556,8 @@ def test_lambda_strict_hard_fails_when_docker_unavailable(monkeypatch):
     }, "code_zip": b"\x00"}
     result = lsvc._execute_function_docker(func, {"k": "v"}, request_id="request-1")
     assert result.get("error") is True
-    assert result["body"]["errorType"] == "Runtime.DockerUnavailable"
+    assert result.get("service_error") is True
+    assert result["body"]["__type"] == "ServiceException"
 
 
 def test_lambda_permissive_falls_back_to_warm_without_docker(monkeypatch):
@@ -8607,7 +8657,7 @@ def _run_nodejs_worker(handler_js, event_payload=None, env_extra=None):
             f"Worker init failed: {init_resp}; stderr: {proc.stderr.read(2048)}"
         )
 
-        event = json.dumps({**(event_payload or {}), "_request_id": "test-req-1"})
+        event = json.dumps({"event": event_payload or {}, "ctx": {"request_id": "test-req-1"}})
         proc.stdin.write(event + "\n")
         proc.stdin.flush()
 
@@ -8709,7 +8759,7 @@ def test_nodejs_worker_aws_sdk_v3_stub_resolves():
     stub backed by Ministack's own service implementations.
     """
     handler_js = """\
-const { Lambda, LambdaClient, InvokeCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
+const { Lambda, LambdaClient, InvokeCommand, ListTagsCommand, waitUntilFunctionActiveV2 } = require("@aws-sdk/client-lambda");
 const { OpenSearch, OpenSearchClient, UpdateDomainConfigCommand } = require("@aws-sdk/client-opensearch");
 const { SFN, SFNClient } = require("@aws-sdk/client-sfn");
 const { SSM, SSMClient, PutParameterCommand, GetParameterCommand } = require("@aws-sdk/client-ssm");
@@ -8717,6 +8767,8 @@ exports.handler = async (_event, _ctx) => ({
   hasLambda: typeof Lambda === "function",
   hasLambdaClient: typeof LambdaClient === "function",
   hasInvokeCommand: typeof InvokeCommand === "function",
+  hasListTagsCommand: typeof ListTagsCommand === "function",
+  hasLambdaSend: typeof new Lambda().send === "function",
   hasWaiter: typeof waitUntilFunctionActiveV2 === "function",
   hasOpenSearch: typeof OpenSearch === "function",
   hasOpenSearchClient: typeof OpenSearchClient === "function",
@@ -8735,6 +8787,8 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasLambda"] is True
     assert r["hasLambdaClient"] is True
     assert r["hasInvokeCommand"] is True
+    assert r["hasListTagsCommand"] is True
+    assert r["hasLambdaSend"] is True
     assert r["hasWaiter"] is True
     assert r["hasOpenSearch"] is True
     assert r["hasOpenSearchClient"] is True
@@ -8745,6 +8799,39 @@ exports.handler = async (_event, _ctx) => ({
     assert r["hasSSMClient"] is True
     assert r["hasPutParameterCommand"] is True
     assert r["hasGetParameterCommand"] is True
+
+
+def test_nodejs_worker_lambda_send_list_tags_command(lam):
+    """Lambda.send(new ListTagsCommand(...)) round-trips real tags.
+
+    This is the call shape Amplify's AmplifyTableManager custom resource uses
+    (new Lambda(), then .send(new ListTagsCommand({ Resource: arn }))), which
+    needs both the ListTagsCommand class and Lambda.send to exist.
+    """
+    name = f"lambda-list-tags-send-{_uuid_mod.uuid4().hex[:8]}"
+    created = lam.create_function(
+        FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE,
+        Handler="index.handler", Code={"ZipFile": _region_marker_code("one")},
+    )
+    arn = created["FunctionArn"]
+    try:
+        lam.tag_resource(Resource=arn, Tags={"env": "test", "team": "backend"})
+
+        handler_js = """\
+const { Lambda, ListTagsCommand } = require("@aws-sdk/client-lambda");
+exports.handler = async (event) => {
+  const client = new Lambda();
+  const command = new ListTagsCommand({ Resource: event.arn });
+  const resp = await client.send(command);
+  return { tags: resp.Tags };
+};
+"""
+        result = _run_nodejs_worker(handler_js, event_payload={"arn": arn})
+        assert result.get("status") == "ok", f"Invocation failed: {result}"
+        assert result["result"]["tags"]["env"] == "test"
+        assert result["result"]["tags"]["team"] == "backend"
+    finally:
+        lam.delete_function(FunctionName=name)
 
 
 def test_nodejs_worker_opensearch_sdk_v3_stub_uses_rest_json():
@@ -9341,15 +9428,15 @@ def test_lambda_durable_function_config_round_trip(lam):
         "Role": _LAMBDA_ROLE,
         "Handler": "index.handler",
         "Code": {"ZipFile": zip_b64},
-        "DurableConfig": {"Enabled": True},
+        "DurableConfig": {"ExecutionTimeout": 900},
     })
     try:
         assert code in (200, 201), body
-        assert body.get("DurableConfig") == {"Enabled": True}
+        assert body.get("DurableConfig") == {"ExecutionTimeout": 900}
         # Boto3 strips unknown fields, so verify the round-trip via raw HTTP.
         code, gf = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
         assert code == 200
-        assert gf["Configuration"].get("DurableConfig") == {"Enabled": True}
+        assert gf["Configuration"].get("DurableConfig") == {"ExecutionTimeout": 900}
     finally:
         try:
             lam.delete_function(FunctionName=fname)
@@ -10864,14 +10951,14 @@ def test_lambda_durable_create_function_durable_config_round_trip_with_update(la
     code, _ = _raw_durable("POST", "/2015-03-31/functions", body={
         "FunctionName": fname, "Runtime": "python3.12", "Role": _LAMBDA_ROLE,
         "Handler": "index.handler", "Code": {"ZipFile": zip_b64},
-        "DurableConfig": {"Enabled": True},
+        "DurableConfig": {"ExecutionTimeout": 900},
     })
     assert code == 201
     try:
         # Touch unrelated config.
         lam.update_function_configuration(FunctionName=fname, Timeout=60, MemorySize=256)
         code, body = _raw_durable("GET", f"/2015-03-31/functions/{fname}")
-        assert body["Configuration"].get("DurableConfig") == {"Enabled": True}, \
+        assert body["Configuration"].get("DurableConfig") == {"ExecutionTimeout": 900}, \
             f"DurableConfig lost after Update: {body['Configuration'].get('DurableConfig')}"
     finally:
         try:
@@ -12792,6 +12879,14 @@ def test_lambda_runs_on_the_architecture_it_declares(lam, declared, expected_mac
         payload = json.loads(resp["Payload"].read())
         if resp.get("FunctionError") and "exec format" in str(payload).lower():
             pytest.skip(f"host cannot run linux/{declared} — no binfmt handler registered")
+        # With no emulation for a foreign architecture, MiniStack falls back to the host's.
+        import platform as _platform
+        import sys as _sys
+        native = {"x86_64": "x86_64", "amd64": "x86_64", "arm64": "aarch64", "aarch64": "aarch64"}.get(
+            _platform.machine().lower())
+        emulated = _sys.platform == "darwin" or os.path.exists(f"/proc/sys/fs/binfmt_misc/qemu-{expected_machine}")
+        if expected_machine != native and not emulated and payload.get("machine") == native:
+            pytest.skip(f"host cannot run linux/{declared} — MiniStack fell back to the host architecture")
         assert resp.get("FunctionError") is None, payload
         assert payload.get("machine") == expected_machine, payload
     finally:
@@ -12825,6 +12920,134 @@ def test_lambda_platform_pinned_only_when_architectures_declared(monkeypatch):
     assert _lam._declared_docker_platform(
         {"FunctionName": "pre-marker-record", "Architectures": ["x86_64"]}) is None
     assert _lam._declared_docker_platform({"FunctionName": "never-created"}) is None
+
+
+def test_lambda_host_docker_arch_names_the_image_architecture(monkeypatch):
+    """The daemon reports x86_64/aarch64; image metadata says amd64/arm64."""
+    from ministack.services import lambda_svc as _lam
+
+    for daemon, expected in (("x86_64", "amd64"), ("aarch64", "arm64")):
+        monkeypatch.setattr(_lam, "_host_docker_arch_cache", [])
+        client = type("C", (), {"info": staticmethod(lambda d=daemon: {"Architecture": d})})()
+        assert _lam._host_docker_arch(client) == expected
+
+
+def test_lambda_docker_flags_platform_wins_and_never_falls_back(monkeypatch):
+    """--platform in LAMBDA_DOCKER_FLAGS is parsed (it was silently ignored), beats the declared
+    platform, and a host that cannot run it raises instead of falling back to the host's."""
+    assert lsvc._parse_docker_flags("--platform linux/amd64 -m 256m") == {"platform": "linux/amd64", "mem_limit": "256m"}
+    assert lsvc._parse_docker_flags("--platform=linux/arm64")["platform"] == "linux/arm64"
+    assert "platform" not in lsvc._parse_docker_flags("--privileged")
+
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "--platform linux/amd64")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    monkeypatch.setattr(lsvc, "_unrunnable_docker_platforms", set())
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+    monkeypatch.setattr(lsvc, "_functions", lsvc.AccountRegionScopedDict())
+    lsvc._functions["flag-fn"] = {"architectures_declared": True}
+    runs, pulls = [], []
+
+    def _run(**kwargs):
+        runs.append(kwargs.get("platform"))
+        container = _mk_container(running=False)
+        container.logs.return_value = b"exec /lambda-entrypoint.sh: exec format error"
+        container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+        return container
+
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    client.containers.run = client.containers.create = _run
+    client.images.get.return_value = MagicMock(attrs={"Architecture": "arm64"})
+    client.images.pull.side_effect = lambda image, platform=None: pulls.append(platform)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+    config = {"FunctionName": "flag-fn", "Runtime": "python3.12", "Handler": "index.handler", "PackageType": "Zip",
+              "Timeout": 3, "MemorySize": 128, "Architectures": ["arm64"],
+              "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:flag-fn"}
+    with pytest.raises(Exception, match="LAMBDA_DOCKER_FLAGS --platform linux/amd64"):
+        lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+    assert runs == ["linux/amd64"] and pulls == ["linux/amd64"] and not lsvc._unrunnable_docker_platforms
+
+
+@pytest.mark.parametrize("failure,remembered", [
+    # What the runtime image logged as it died on GitHub's x86_64 and arm64
+    # runners (no binfmt handler) for a function declaring the other platform.
+    (b"exec /lambda-entrypoint.sh: exec format error", True),
+    (b"some unrelated crash", False),
+    # An Image function's own entrypoint, broken whatever the platform.
+    (b"exec /app/entry.sh: exec format error", False),
+    # Docker's error carries the request URL, ?platform=linux%2Famd64 included.
+    ('400 Client Error for http+docker://localhost/v1.53/containers/create?platform=linux%2Famd64: '
+     'Bad Request ("invalid mount config for type "bind": bind source path does not exist")', False),
+    # Another spawn swapped the runtime tag between this one's pull and create.
+    ("404 Client Error: image with reference public.ecr.aws/lambda/python:3.12 was found "
+     "but does not match the specified platform: wanted linux/amd64, actual: linux/arm64", False),
+])
+def test_lambda_unrunnable_declared_platform_is_remembered(monkeypatch, tmp_path, failure, remembered):
+    """A host that cannot run a declared platform falls back to its own once.
+
+    On an arm64 host with no amd64 emulation, a function declaring x86_64 used
+    to relearn that on every cold start: pull the amd64 image over the runtime
+    tag, start a container that dies with an exec-format error, then pull the
+    host's image back. Once a container has failed for its architecture, later
+    spawns run on the host's straight away. A container that died for another
+    reason, or could not be created for one, says nothing about the host, so
+    the platform is pinned again.
+    """
+    monkeypatch.setattr(lsvc, "LAMBDA_DOCKER_FLAGS", "")
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: False)
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    monkeypatch.setattr(lsvc, "_unrunnable_docker_platforms", set())
+    monkeypatch.setenv("AWS_ENDPOINT_URL", "http://localhost:4566")
+    monkeypatch.setattr(lsvc, "_functions", lsvc.AccountRegionScopedDict())
+    lsvc._functions["arch-x86-fn"] = {"architectures_declared": True}
+
+    runs, pulls = [], []
+
+    def _run(**kwargs):
+        runs.append(kwargs.get("platform"))
+        if kwargs.get("platform") == "linux/amd64" and isinstance(failure, str):
+            raise RuntimeError(failure)
+        container = _mk_container(running=kwargs.get("platform") != "linux/amd64")
+        container.logs.return_value = failure
+        container.ports = {"8080/tcp": [{"HostPort": "9999"}]}
+        return container
+
+    client = MagicMock()
+    client.info.return_value = {"Architecture": "aarch64"}
+    client.containers.run = _run
+    client.containers.create = _run
+    client.images.get.return_value = MagicMock(attrs={"Architecture": "arm64"})
+    client.images.pull.side_effect = lambda image, platform=None: pulls.append(platform)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: client)
+
+    config = {
+        "FunctionName": "arch-x86-fn", "Runtime": "python3.12", "Handler": "index.handler",
+        "PackageType": "Zip", "Timeout": 3, "MemorySize": 128, "Architectures": ["x86_64"],
+        "FunctionArn": "arn:aws:lambda:us-east-1:000000000000:function:arch-x86-fn",
+    }
+    code = _make_zip("def handler(e, c): pass")
+    lsvc._spawn_lambda_container(config, code)
+    assert runs == ["linux/amd64", None]
+    assert pulls == ["linux/amd64"]
+
+    runs.clear(), pulls.clear()
+    lsvc._spawn_lambda_container(config, code)
+    if remembered:
+        assert runs == [None] and pulls == []
+        # A handler installed since takes effect after a reset. The reset runs
+        # on throwaway state: the code caches are shared with the live server.
+        _fresh_extract_cache(monkeypatch, tmp_path)
+        for name in ("_layers", "_esms", "_function_urls", "_kinesis_positions",
+                     "_dynamodb_stream_positions", "_esm_backoff_until"):
+            monkeypatch.setattr(lsvc, name, lsvc.AccountRegionScopedDict())
+        monkeypatch.setattr(lsvc, "_pool_clear_all", lambda: None)
+        lsvc.reset()
+        assert lsvc._unrunnable_docker_platforms == set()
+    else:
+        assert runs == ["linux/amd64", None] and pulls == ["linux/amd64"]
 
 
 # ─────────────────────────────── SnapStart ───────────────────────────────
@@ -13049,6 +13272,73 @@ def test_spawn_failure_after_extraction_keeps_the_cache(monkeypatch, tmp_path):
     assert key.startswith("code-") and os.path.isdir(lsvc._docker_extract_dirs[key])
 
 
+
+def _pinned_arm64_spawn(monkeypatch, tmp_path, containers):
+    """A fake daemon for an arm64-pinned function on an arm64 host whose
+    ``containers.create`` hands out ``containers`` in order. MiniStack runs in
+    a container (the Testcontainers case), so code goes in by docker cp."""
+    monkeypatch.setattr(lsvc, "_docker_available", True)
+    monkeypatch.setattr(lsvc, "_running_in_container", lambda: True)
+    monkeypatch.setattr(lsvc, "_functions", {"leak-fn": {"architectures_declared": True}})
+    monkeypatch.setattr(lsvc, "_host_docker_arch_cache", [])
+    fake_client = MagicMock()
+    fake_client.info.return_value = {"Architecture": "aarch64"}
+    fake_client.images.get.return_value.attrs = {"Architecture": "arm64"}
+    fake_client.containers.create.side_effect = list(containers)
+    monkeypatch.setattr(lsvc, "_get_docker_client", lambda: fake_client)
+    _fresh_extract_cache(monkeypatch, tmp_path)
+    config = dict(_SPAWN_LEAK_CONFIG, Architectures=["arm64"])
+    return fake_client, config
+
+
+@pytest.mark.parametrize("error", [
+    pytest.param(lambda: __import__("requests").exceptions.ReadTimeout(
+        "UnixHTTPConnectionPool(host='localhost', port=None): Read timed out."), id="requests-read-timeout"),
+    pytest.param(lambda: __import__("requests").exceptions.ConnectionError("Connection aborted."),
+                 id="requests-connection-error"),
+    pytest.param(lambda: TimeoutError("timed out"), id="socket-timeout"),
+])
+def test_spawn_start_transport_error_removes_container_without_platform_fallback(
+        monkeypatch, tmp_path, caplog, error):
+    """A daemon transport failure after create() must not leave the created
+    container behind, and is not evidence the host cannot run the declared
+    platform: it propagates instead of spawning a second, host-arch container."""
+    exc = error()
+    leaked = MagicMock(id="c-timeout")
+    leaked.start.side_effect = exc
+    fake_client, config = _pinned_arm64_spawn(monkeypatch, tmp_path, [leaked])
+
+    with caplog.at_level("WARNING", logger=lsvc.logger.name):
+        with pytest.raises(type(exc)):
+            lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+
+    leaked.remove.assert_called_once_with(force=True, v=True)
+    assert fake_client.containers.create.call_count == 1
+    assert fake_client.containers.create.call_args.kwargs["platform"] == "linux/arm64"
+    assert "cannot run it" not in caplog.text
+
+
+def test_spawn_platform_error_removes_container_then_falls_back(monkeypatch, tmp_path):
+    """A daemon refusal that is about the platform still falls back to the
+    host's architecture, and the refused container is removed first."""
+    import docker
+
+    refused = MagicMock(id="c-refused")
+    refused.start.side_effect = docker.errors.APIError(
+        "exec /lambda-entrypoint.sh: exec format error")
+    fallback = MagicMock(id="c-fallback")
+    fake_client, config = _pinned_arm64_spawn(monkeypatch, tmp_path, [refused, fallback])
+
+    container, _tmpdir = lsvc._spawn_lambda_container(config, _make_zip("def handler(e, c): pass"))
+
+    assert container is fallback
+    refused.remove.assert_called_once_with(force=True, v=True)
+    fallback.remove.assert_not_called()
+    first, second = fake_client.containers.create.call_args_list
+    assert first.kwargs["platform"] == "linux/arm64"
+    assert second.kwargs.get("platform") != "linux/arm64"
+
+
 def test_docker_extracted_dir_is_content_addressed(monkeypatch, tmp_path):
     """Identical blobs share one tree; different blobs and kinds get their
     own. The dirs are what every container of that code receives (read-only
@@ -13079,6 +13369,62 @@ def test_context_arn_shim_survives_a_cached_code_dir(tmp_path):
     # A same-named file that came from the user's own zip is left alone.
     (code_dir / "_msctx_shim.js").write_text("// user's own module")
     assert lsvc._write_context_arn_shim(str(code_dir), "nodejs20.x", "index.handler") is None
+
+
+def test_context_arn_shim_concurrent_cold_starts_all_get_the_shim(tmp_path):
+    """Concurrent cold starts of one function write the shim into the same code dir; each gets it."""
+    import threading
+
+    code_dir = tmp_path / "code"
+    code_dir.mkdir()
+    barrier = threading.Barrier(8)
+    results = []
+
+    def cold_start():
+        barrier.wait()
+        results.append(lsvc._write_context_arn_shim(str(code_dir), "nodejs22.x", "lambda.handler"))
+
+    threads = [threading.Thread(target=cold_start) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert results == ["_msctx_shim.handler"] * 8
+    assert sorted(p.name for p in code_dir.iterdir()) == ["_msctx_shim.cjs"]
+
+
+
+@pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
+def test_node_context_shim_runs_in_a_type_module_package(tmp_path):
+    """A package.json with "type": "module" makes Node load every .js file as
+    ESM, so a CommonJS shim named .js failed on `require` before the handler
+    ran (#2504). On AWS the same zip runs; the shim is now a .cjs file."""
+    import subprocess
+
+    code_dir = tmp_path / "task"
+    (code_dir / "dist").mkdir(parents=True)
+    (code_dir / "package.json").write_text('{"type": "module"}')
+    (code_dir / "dist" / "index.js").write_text(
+        "export const handler = async (event, context) =>\n"
+        "  ({ ok: true, arn: context.invokedFunctionArn, x: event.x });\n"
+    )
+    assert lsvc._write_context_arn_shim(str(code_dir), "nodejs24.x", "dist/index.handler") == "_msctx_shim.handler"
+    assert not (code_dir / "_msctx_shim.js").exists()
+    arn = "arn:aws:lambda:us-east-1:000000000000:function:esm"
+    env = {**os.environ, "LAMBDA_TASK_ROOT": str(code_dir), "_MS_REAL_HANDLER": "dist/index.handler",
+           "_LAMBDA_FUNCTION_ARN": arn}
+    script = ("require(process.argv[1]).handler({x: 7}, {})"
+              ".then((r) => process.stdout.write(JSON.stringify(r)));")
+    proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.cjs")],
+                          env=env, capture_output=True, text=True, timeout=30)
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout) == {"ok": True, "arn": arn, "x": 7}
+    # The runtime tries .js and .mjs before .cjs: a user's module of either name
+    # would shadow the shim, so the handler then runs unwrapped.
+    for ext in (".js", ".mjs"):
+        (code_dir / f"_msctx_shim{ext}").write_text("// user's own module")
+        assert lsvc._write_context_arn_shim(str(code_dir), "nodejs24.x", "dist/index.handler") is None
+        (code_dir / f"_msctx_shim{ext}").unlink()
 
 
 @pytest.mark.skipif(not shutil.which("node"), reason="node not installed")
@@ -13153,7 +13499,7 @@ def test_node_context_shim_downgrades_https_to_the_gateway(tmp_path):
 
         def run(host, hport=None, form="options"):
             proc = subprocess.run(
-                ["node", "-e", script, str(code_dir / "_msctx_shim.js"), host, str(hport or ""), form],
+                ["node", "-e", script, str(code_dir / "_msctx_shim.cjs"), host, str(hport or ""), form],
                 env=env, capture_output=True, text=True, timeout=30,
             )
             assert proc.returncode == 0, proc.stderr
@@ -13220,7 +13566,7 @@ def test_node_context_shim_keeps_https_to_a_tls_gateway(tmp_path):
                "AWS_ENDPOINT_URL": f"https://127.0.0.1:{port}"}
         script = ("require(process.argv[1]).handler({port: Number(process.argv[2])}, {})"
                   ".then((r) => process.stdout.write(JSON.stringify(r)));")
-        proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), str(port)],
+        proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.cjs"), str(port)],
                               env=env, capture_output=True, text=True, timeout=30)
         assert proc.returncode == 0, proc.stderr
         # Still TLS: the plain-HTTP listener never sees the request as HTTP.
@@ -13282,7 +13628,7 @@ def test_node_context_shim_sends_the_https_default_port_to_a_tls_gateway(tmp_pat
                   ".then((r) => process.stdout.write(JSON.stringify(r)));")
 
         def run(event):
-            proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.js"), json.dumps(event)],
+            proc = subprocess.run(["node", "-e", script, str(code_dir / "_msctx_shim.cjs"), json.dumps(event)],
                                   env=env, capture_output=True, text=True, timeout=30)
             assert proc.returncode == 0, proc.stderr
             return json.loads(proc.stdout)
@@ -13945,7 +14291,7 @@ def test_bootstrap_that_exits_immediately_fails_fast(worker_factory):
     worker = worker_factory(INSTANT_EXIT_BOOTSTRAP)
 
     started = time.monotonic()
-    with pytest.raises(RuntimeError, match="exited during init with code 3"):
+    with pytest.raises(RuntimeError, match="^Runtime exited with error: exit status 3$"):
         worker.invoke({}, "req-1")
     elapsed = time.monotonic() - started
 
@@ -13983,6 +14329,7 @@ def test_a_missing_bootstrap_is_runtime_invalid_entrypoint(worker_factory):
     with pytest.raises(lambda_runtime.ProvidedRuntimeError) as excinfo:
         worker.invoke({}, "req-1")
     assert excinfo.value.error_type == "Runtime.InvalidEntrypoint"
+    assert str(excinfo.value) == "Couldn't find valid bootstrap(s): [/var/task/bootstrap /opt/bootstrap]"
 
 
 # ---------------------------------------------------------------------------
@@ -14431,7 +14778,9 @@ def test_provided_failure_is_scoped_and_not_retried(monkeypatch, isolated_pool):
     monkeypatch.setattr(lambda_svc, "_execute_function_provided", fallback)
     result = lambda_svc._execute_function_provided_warm({"config": config, "code_zip": b"zip"}, {}, request_id="request-1")
     assert result["error"] is True
-    assert result["body"]["errorMessage"] == "bootstrap crashed"
+    assert result["service_error"] is True
+    assert result["body"] == {"__type": "ServiceException",
+                              "message": "MiniStack could not run the function's bootstrap: bootstrap crashed"}
     assert fail.call_count == 1
     fallback.assert_not_called()
     remaining = [w for entries in lambda_runtime._workers.values() for w in entries]
@@ -15929,3 +16278,26 @@ def test_esm_kinesis_last_processing_result_is_aws_wording(lam, kin, code, resul
     finally:
         lam.delete_function(FunctionName=fn)
         kin.delete_stream(StreamName=stream)
+
+
+def test_lambda_log_events_carry_an_event_id(lam, logs):
+    """Every event FilterLogEvents returns has a unique eventId, as on AWS (FilteredLogEvent);
+    `aws logs tail --follow` relies on it. Events a Lambda writes came without one."""
+    name = f"log-event-id-{_uuid_mod.uuid4().hex[:8]}"
+    marker = f"marker-{_uuid_mod.uuid4().hex}"
+    lam.create_function(
+        FunctionName=name, Runtime="python3.12", Role=_LAMBDA_ROLE, Handler="index.handler",
+        Code={"ZipFile": _make_zip(f"def handler(event, context):\n    print('{marker}')\n    return 1\n")},
+    )
+    try:
+        for _ in range(2):
+            lam.invoke(FunctionName=name, Payload=b"{}")
+        assert any(marker in m for m in _wait_log_marker(logs, f"/aws/lambda/{name}", marker))
+
+        events = logs.filter_log_events(logGroupName=f"/aws/lambda/{name}")["events"]
+        assert events
+        ids = [event.get("eventId") for event in events]
+        assert all(ids), events
+        assert len(set(ids)) == len(ids)
+    finally:
+        lam.delete_function(FunctionName=name)

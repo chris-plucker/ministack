@@ -41,6 +41,8 @@ clients can call DescribeDBInstances and other operations without ``Action=`` qu
 parameters.
 """
 
+import base64
+import contextlib
 import contextvars
 import copy
 import datetime
@@ -70,6 +72,7 @@ from ministack.core.responses import (
     get_account_id,
     get_region,
     new_uuid,
+    request_scope,
 )
 from ministack.services import secretsmanager
 from ministack.services.rds_iam_plugin import (
@@ -822,7 +825,11 @@ def _restore_state(data, *, resume_runtime=False):
                     else cluster.get("DatabaseName") or "mydb",
                     _container_alive,
                 )
-                if authenticated_ready and _is_mysql_engine(
+                if authenticated_ready and _is_postgres_engine(
+                    cluster.get("Engine", ""),
+                ):
+                    _ensure_pg_iam_auth(container_id, cluster.get("Engine", ""), cluster_id)
+                elif authenticated_ready and _is_mysql_engine(
                     cluster.get("Engine", ""),
                 ):
                     _ensure_mysql_compatibility(
@@ -907,6 +914,8 @@ def _restore_state(data, *, resume_runtime=False):
                             cluster.get("Engine", ""),
                         )
                     cluster["_shared_container_ready"] = authenticated_ready
+                    if authenticated_ready:
+                        _apply_deferred_global_writer_alias(cluster)
                     if authenticated_ready and _aurora_mysql_8_replication_enabled(
                         cluster,
                     ):
@@ -1142,11 +1151,11 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
     client using sslmode=verify-full with our CA connects. Plaintext clients
     keep working, as they do on AWS without rds.force_ssl.
     """
+    if engine in ("postgres", "aurora-postgresql") or _is_mysql_engine(engine):
+        # IAM database authentication calls back to a host-run MiniStack.
+        container_kwargs.setdefault("extra_hosts", {}).setdefault(
+            "host.docker.internal", "host-gateway")
     if engine not in ("postgres", "aurora-postgresql"):
-        if _is_mysql_engine(engine):
-            # The IAM auth plugin calls back to a host-run MiniStack.
-            container_kwargs.setdefault("extra_hosts", {}).setdefault(
-                "host.docker.internal", "host-gateway")
         return docker_client.containers.run(**container_kwargs)
     # Injecting the certificate needs create -> put_archive -> start, so a
     # client that cannot do that keeps the plain launch and serves plaintext.
@@ -1290,7 +1299,7 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         image=image,
         detach=True,
         environment=env,
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=container_name,
         labels={
             **container_reaper.own_labels("rds"),
@@ -1334,6 +1343,17 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
         or _rds_cluster_docker_volume_name(cluster_id)
     )
     cluster["_shared_volume_name"] = volume_name
+    # Created with MiniStack's labels so the boot and shutdown sweeps can find it (it outlives the
+    # container); a volume that already exists keeps its data.
+    try:
+        docker_client.volumes.get(volume_name)
+    except Exception:
+        try:
+            docker_client.volumes.create(name=volume_name, labels={
+                **container_reaper.own_labels("rds"), "cluster_id": cluster_id,
+                "account_id": get_account_id(), "region": get_region()})
+        except Exception as e:
+            logger.warning("RDS: could not create volume %s: %s", volume_name, e)
     container_kwargs["volumes"] = {
         volume_name: {"bind": data_path, "mode": "rw"},
     }
@@ -1347,24 +1367,28 @@ def _start_cluster_shared_container(cluster_id, cluster, remove_stale=False):
     # {'EndpointsConfig': ...} — fails that check and the aliases vanish without
     # an error. network= also sets host_config's network_mode, so removing it
     # breaks the container outright.
-    endpoint_aliases = (
-        _cluster_endpoint_aliases(cluster)
-        if _network_supports_aliases(container_kwargs.get("network"))
-        else []
+    aliasable = _network_supports_aliases(container_kwargs.get("network"))
+    endpoint_aliases = _cluster_endpoint_aliases(cluster) if aliasable else []
+    network_aliases = (
+        endpoint_aliases + _global_writer_endpoint_aliases(cluster) if aliasable else []
     )
-    if endpoint_aliases:
+    if network_aliases:
         # The endpoint config is written out directly rather than through
         # docker_client.api.create_endpoint_config, which returns exactly this
         # dict. Reaching for .api also reaches past the test doubles this module
         # is exercised with, and they have no such attribute.
         container_kwargs["networking_config"] = {
-            container_kwargs["network"]: {"Aliases": list(endpoint_aliases)},
+            container_kwargs["network"]: {"Aliases": network_aliases},
         }
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            tls_names=list(endpoint_aliases) + [container_kwargs.get("name") or ""],
-        )
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                # The first name becomes the CN, so the global name goes last.
+                tls_names=list(endpoint_aliases)
+                + [kwargs.get("name") or ""]
+                + (_global_member_certificate_names(cluster) if aliasable else []),
+            ), container_kwargs, _next_port)
     except Exception as e:
         cluster["_shared_container_ready"] = False
         logger.warning("RDS: failed to start shared container for cluster %s: %s", cluster_id, e)
@@ -1576,16 +1600,11 @@ def _start_pg_reader_container(db_id, cluster):
         detach=True,
         environment=env,
         command=["sh", "-c", _PG_READER_BOOTSTRAP_SCRIPT],
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=_rds_docker_name(db_id),
         network=ms_network,
-        labels={
-            "ministack": "rds",
-            "db_id": db_id,
-            "cluster_id": cluster_id,
-            "account_id": get_account_id(),
-            "region": get_region(),
-        },
+        labels=container_reaper.own_labels(
+            "rds", db_id=db_id, cluster_id=cluster_id, account_id=get_account_id(), region=get_region()),
     )
     volume_name = None
     if RDS_PERSIST:
@@ -1598,11 +1617,13 @@ def _start_pg_reader_container(db_id, cluster):
             data_path: f"rw,noexec,nosuid,size={RDS_TMPFS_SIZE}",
         }
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            tls_names=_cluster_endpoint_aliases(cluster)
-            + [container_kwargs.get("name") or ""],
-        )
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                tls_names=_cluster_endpoint_aliases(cluster)
+                + [kwargs.get("name") or ""]
+                + _global_member_certificate_names(cluster),
+            ), container_kwargs, _next_port)
     except Exception as e:
         logger.warning(
             "RDS: failed to start reader container for %s: %s", db_id, e,
@@ -2446,7 +2467,7 @@ def _start_rds_container_for_instance(db_id, instance):
     container_kwargs = dict(
         image=image, detach=True,
         environment=env_vars,
-        ports={f"{container_port}/tcp": host_port},
+        ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
         name=container_name,
         labels={
             **container_reaper.own_labels("rds"),
@@ -2476,15 +2497,21 @@ def _start_rds_container_for_instance(db_id, instance):
         groups[0]["ParameterApplyStatus"] = "in-sync"
 
     try:
-        container = _run_rds_container(
-            docker_client, engine, container_kwargs,
-            tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
-                       container_kwargs.get("name") or ""],
-        )
+        moved_from = host_port
+        container, host_port = container_reaper.run_on_free_port(
+            docker_client, lambda kwargs: _run_rds_container(
+                docker_client, engine, kwargs,
+                tls_names=[(instance.get("Endpoint") or {}).get("Address") or "",
+                           kwargs.get("name") or ""],
+            ), container_kwargs, _next_port)
     except Exception as e:
         logger.warning("RDS: failed to respawn container for %s: %s", db_id, e)
         instance["DBInstanceStatus"] = "failed"
         return
+    if host_port != moved_from:
+        if endpoint.get("Port") == moved_from:
+            endpoint["Port"] = host_port
+        instance["_HostPort"] = host_port
 
     # Check-and-publish under the lock, so a DeleteDBInstance cannot land in the
     # gap between them and leave this container referenced by nothing. The check
@@ -2526,7 +2553,9 @@ def _start_rds_container_for_instance(db_id, instance):
             pass
     instance["_internal_address"] = internal_host
     instance["_internal_port"] = internal_port
-    if _is_mysql_engine(engine):
+    if _is_postgres_engine(engine):
+        _ensure_pg_iam_auth(container.id, engine, instance.get("DBClusterIdentifier") or db_id)
+    elif _is_mysql_engine(engine):
         _ensure_mysql_compatibility(
             container.id,
             internal_host or "127.0.0.1",
@@ -2988,6 +3017,61 @@ def _iam_broker_host():
             pass
     # Mapped to host-gateway on every MySQL container (_run_rds_container).
     return "host.docker.internal"
+
+
+# rds_iam members authenticate through MiniStack's IAM broker; on AWS "IAM
+# authentication takes precedence over password authentication" for them.
+_PG_IAM_AUTH_SCRIPT = """set -eu
+i=0
+until pg_isready -q -h 127.0.0.1 -p 5432; do
+    i=$((i + 1)); [ "$i" -lt 300 ] || exit 1; sleep 1
+done
+psql -v ON_ERROR_STOP=1 -q --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<'SQL'
+DO $do$
+BEGIN
+    IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'rds_iam') THEN
+        CREATE ROLE rds_iam;
+    END IF;
+END
+$do$;
+SQL
+{ printf 'host all +rds_iam all ldap ldapserver=%s ldapport=%s ldapprefix="cap=%s,uid=" # ministack-rds-iam\\n' \\
+    "$MINISTACK_IAM_HOST" "$MINISTACK_IAM_PORT" "$MINISTACK_IAM_CAPABILITY"
+  grep -v ' # ministack-rds-iam$' "$PGDATA/pg_hba.conf" || true; } > /tmp/ministack-pg_hba.conf
+cat /tmp/ministack-pg_hba.conf > "$PGDATA/pg_hba.conf"
+rm -f /tmp/ministack-pg_hba.conf
+psql -v ON_ERROR_STOP=1 -q --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \\
+    -c "SELECT pg_reload_conf()" >/dev/null
+"""
+
+
+def _ensure_pg_iam_auth(container_id, engine, resource_id):
+    """Route rds_iam members' logins to the IAM broker (best effort)."""
+    from ministack.core import rds_iam
+
+    docker_client = _get_docker()
+    if not docker_client or not container_id:
+        return False
+    try:
+        container = docker_client.containers.get(container_id)
+        capability = rds_iam.issue_capability(
+            account_id=get_account_id(), region=get_region(),
+            resource_kind="cluster" if engine.startswith("aurora") else "instance",
+            resource_identifier=resource_id,
+        )
+        exit_code, output = container.exec_run(["sh", "-c", _PG_IAM_AUTH_SCRIPT], environment={
+            "MINISTACK_IAM_HOST": _iam_broker_host(),
+            "MINISTACK_IAM_PORT": str(rds_iam.ldap_port()),
+            "MINISTACK_IAM_CAPABILITY": capability,
+        })
+    except Exception as e:
+        logger.warning("RDS: failed to configure IAM authentication for %s: %s", resource_id, e)
+        return False
+    if exit_code != 0:
+        logger.warning("RDS: IAM authentication setup for %s exited %s: %s", resource_id, exit_code,
+                       output.decode(errors="replace") if isinstance(output, bytes) else output)
+        return False
+    return True
 
 
 def _mysql_replication_connection(cluster, *, timeout=None):
@@ -4028,7 +4112,7 @@ def _refresh_cluster_status(cluster_id):
     cluster = _clusters.get(cluster_id)
     if not cluster:
         return
-    if cluster.get("Status") in ("stopping", "stopped", "deleting"):
+    if cluster.get("Status") in ("stopping", "stopped", "deleting", "upgrading"):
         return
     member_ids = {
         m.get("DBInstanceIdentifier")
@@ -4059,6 +4143,8 @@ def _is_host_port_free(port: int) -> bool:
     `containers.run`, but it closes the common case of stale or
     user-process bindings."""
     import socket
+    if port in _daemon_published_ports():
+        return False
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
         s.bind(("0.0.0.0", port))
@@ -4067,6 +4153,26 @@ def _is_host_port_free(port: int) -> bool:
         return False
     finally:
         s.close()
+
+
+_published_cache = [0.0, frozenset()]
+
+
+def _daemon_published_ports() -> frozenset:
+    """Host ports the Docker daemon publishes for running containers, which a bind
+    probe inside MiniStack's own container cannot see (cached for two seconds)."""
+    if time.time() - _published_cache[0] < 2:
+        return _published_cache[1]
+    ports = frozenset()
+    docker_client = _get_docker()
+    if docker_client is not None:
+        try:
+            ports = frozenset(p["PublicPort"] for c in docker_client.api.containers()
+                              for p in c.get("Ports") or [] if p.get("PublicPort"))
+        except Exception as e:
+            logger.debug("RDS: published ports unavailable: %s", e)
+    _published_cache[0], _published_cache[1] = time.time(), ports
+    return ports
 
 
 # Docker refuses network-scoped aliases outside user-defined networks:
@@ -4121,6 +4227,299 @@ def _cluster_endpoint_aliases(cluster):
             aliases.append(value.replace(".cluster-", ".cluster-ro-", 1))
         return aliases
     return []
+
+
+_GLOBAL_ENDPOINT_SUFFIX = ".global.rds.amazonaws.com"
+
+
+def _global_writer_endpoint_aliases(cluster):
+    """The global writer endpoint, while this cluster is its global cluster's writer.
+
+    DescribeGlobalClusters hands out ``<id>.global-<token>.global.rds.amazonaws.com``
+    and on AWS that name resolves to the primary cluster's writer. Only the
+    writer member's container may carry it: Docker answers a name shared by
+    several containers with all of their addresses.
+    """
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if global_cluster and member and member.get("IsWriter"):
+        return [_global_cluster_endpoint(global_cluster)]
+    return []
+
+
+def _global_member_certificate_names(cluster):
+    """The global endpoint while this cluster is any member of a global cluster, whatever its role."""
+    global_cluster, member = _global_cluster_member_for_cluster(cluster)
+    if not (global_cluster and member):
+        return []
+    name = _global_cluster_endpoint(global_cluster)
+    return [name] if name.isascii() else []  # a non-ASCII identifier can't be signed into a certificate
+
+
+def _global_writer_alias_rejoin(cluster, global_endpoint, is_writer):
+    """What has to rejoin the network for this cluster's container to carry the
+    global writer endpoint exactly when ``is_writer``: ``(docker_client,
+    network_name, container)``, or None when nothing has to change or there is
+    no container on an aliasable network.
+    """
+    found = _cluster_container_on_alias_network(cluster)
+    if not found or (global_endpoint in _container_network_aliases(*found[1:])) == is_writer:
+        return None
+    return found
+
+
+def _cluster_container_on_alias_network(cluster):
+    """``(docker_client, network_name, container)`` for a cluster's container on
+    a network that takes aliases, or None."""
+    container_id = cluster.get("_shared_container_id")
+    docker_client = _get_docker() if container_id else None
+    if not docker_client:
+        return None
+    network_name = _get_ministack_network(docker_client)
+    if not _network_supports_aliases(network_name):
+        return None
+    try:
+        container = docker_client.containers.get(container_id)
+    except Exception as e:
+        logger.warning(
+            "RDS: cannot check the network aliases of cluster %s: %s",
+            cluster.get("DBClusterIdentifier", "unknown"), e,
+        )
+        return None
+    return docker_client, network_name, container
+
+
+def _container_network_aliases(network_name, container):
+    return list(
+        (container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(network_name) or {})
+        .get("Aliases") or []
+    )
+
+
+def _refresh_cluster_internal_address(cluster, container, network_name):
+    """Follow a container that rejoined the network to its address. True when it moved."""
+    try:
+        container.reload()
+    except Exception:
+        return False
+    address = (
+        container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        .get(network_name, {}).get("IPAddress", "")
+    )
+    previous = cluster.get("_shared_internal_address")
+    if not (address and previous) or address == previous:
+        return False
+    cluster["_shared_internal_address"] = address
+    endpoint = cluster.get("_shared_endpoint") or {}
+    # Without endpoint aliases the reported endpoint is the address itself.
+    reported_moved = endpoint.get("Address") == previous
+    if reported_moved:
+        endpoint["Address"] = address
+    for instance in _cluster_member_instances(cluster):
+        if instance.get("_internal_address"):
+            instance["_internal_address"] = address
+        if reported_moved and (instance.get("Endpoint") or {}).get("Address") == previous:
+            instance["Endpoint"]["Address"] = address
+    # The reader endpoint can publish the internal address even when the
+    # writer publishes a name.
+    _sync_cluster_endpoints(cluster)
+    return True
+
+
+def _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, docker_client, network_name, container):
+    """Move a container off the network and back on with or without the global name.
+
+    Docker fixes a container's aliases when it joins a network, so this is the
+    only way to change them. The container may come back on another address;
+    internal wiring is refreshed to it, and MySQL global replicas are pointed at
+    the writer's new address. Returns whether the aliases now match ``is_writer``.
+    """
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    previous = _container_network_aliases(network_name, container)
+    aliases = _cluster_endpoint_aliases(cluster) + ([global_endpoint] if is_writer else [])
+    network = None
+    disconnected = False
+    try:
+        network = docker_client.networks.get(network_name)
+        network.disconnect(container)
+        disconnected = True
+        network.connect(container, aliases=aliases)
+    except Exception as e:
+        logger.error(
+            "RDS: failed to move global writer endpoint %s on cluster %s: %s",
+            global_endpoint, cluster_id, e,
+        )
+        if disconnected:
+            # Put the container back as it was rather than leave its cluster
+            # endpoint unreachable.
+            try:
+                network.connect(container, aliases=previous)
+            except Exception as restore_error:
+                logger.error(
+                    "RDS: could not reconnect cluster %s to %s: %s",
+                    cluster_id, network_name, restore_error,
+                )
+        if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
+            _repoint_global_replicas(cluster)
+        return False
+    if _refresh_cluster_internal_address(cluster, container, network_name) and is_writer:
+        _repoint_global_replicas(cluster)
+    return True
+
+
+def _repoint_global_replicas(cluster):
+    """Point MySQL global replicas at a writer whose container changed address."""
+    cluster_id = cluster.get("DBClusterIdentifier", "unknown")
+    try:
+        _configure_or_defer_mysql_replication(cluster_id, cluster)
+    except Exception as e:
+        # The writer change this follows has already been committed.
+        logger.warning(
+            "RDS: failed to re-point MySQL replicas for cluster %s: %s",
+            cluster_id, e,
+        )
+
+
+def _cluster_container_starting(cluster):
+    """A readiness probe is polling this cluster's container at its launch address.
+
+    Stopped or failed containers have no probe, so they can move at once.
+    """
+    if cluster.get("_shared_container_ready") and not any(
+        instance.get("DBInstanceStatus") == "rebooting"
+        for instance in _cluster_member_instances(cluster)
+    ):
+        return False
+    # Cluster "creating" is derived from member statuses and stays set when a
+    # member failed, so the members decide; "starting" is StartDBCluster's own.
+    if cluster.get("Status") == "starting":
+        return True
+    # A reboot restarts the container and probes the address it had before.
+    return any(
+        instance.get("DBInstanceStatus") in ("creating", "starting", "rebooting")
+        for instance in _cluster_member_instances(cluster)
+    )
+
+
+def _move_global_writer_alias(global_endpoint, targets):
+    """Give each ``(cluster, is_writer)`` the global writer endpoint exactly when it is the writer.
+
+    Targets are applied in order, so non-writers go first and the name is
+    dropped from the old writer before the new one takes it.
+    """
+    with _shared_container_lock:
+        moves = []
+        for cluster, is_writer in targets:
+            rejoin = _global_writer_alias_rejoin(cluster, global_endpoint, is_writer)
+            if rejoin:
+                moves.append((cluster, is_writer, rejoin))
+        starting = [
+            cluster.get("DBClusterIdentifier", "unknown")
+            for cluster, _is_writer, _rejoin in moves
+            if _cluster_container_starting(cluster)
+        ]
+        if starting:
+            # The readiness probe holds the launch address, and rejoining the
+            # network can change it. The move is applied once the container is
+            # ready (_apply_deferred_global_writer_alias).
+            logger.info(
+                "RDS: deferring global writer endpoint %s until %s is ready",
+                global_endpoint, ", ".join(starting),
+            )
+            return
+        stranded = [
+            cluster.get("DBClusterIdentifier", "unknown")
+            for cluster, _is_writer, _rejoin in moves
+            if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster))
+        ]
+        if stranded:
+            # Hot-standby readers stream from the writer's address, and rejoining
+            # the network can change it. Moving only some of the containers would
+            # leave the name on two of them, so none moves.
+            logger.error(
+                "RDS: not moving global writer endpoint %s: the readers of %s "
+                "replicate from the current address",
+                global_endpoint, ", ".join(stranded),
+            )
+            return
+        for cluster, is_writer, rejoin in moves:
+            moved = _rejoin_with_global_writer_alias(cluster, global_endpoint, is_writer, *rejoin)
+            if not moved and not is_writer:
+                # The name is still on this container; giving it to the writer
+                # as well would make it answer with two addresses.
+                logger.error(
+                    "RDS: global writer endpoint %s left where it was after cluster %s failed to drop it",
+                    global_endpoint, cluster.get("DBClusterIdentifier", "unknown"),
+                )
+                return
+
+
+def _sync_global_writer_endpoint_aliases(global_cluster):
+    """Keep the global writer endpoint on the current writer member's container only."""
+    if not global_cluster:
+        return
+    # Read the members under the lock, so a concurrent writer change cannot
+    # hand this sync a stale writer.
+    with _shared_container_lock:
+        members = sorted(
+            global_cluster.get("GlobalClusterMembers", []),
+            key=lambda member: bool(member.get("IsWriter")),
+        )
+        targets = []
+        for member in members:
+            cluster = _resolve_global_member_cluster(member)
+            if cluster:
+                targets.append((cluster, bool(member.get("IsWriter"))))
+        _move_global_writer_alias(_global_cluster_endpoint(global_cluster), targets)
+
+
+def _apply_deferred_global_writer_alias(cluster):
+    """Bring the global writer endpoint in line once a cluster's container has
+    finished starting, whether it became ready or failed: moves held back while
+    it was starting, and global names a member container no longer owns (kept
+    across a restart, or left on a non-writer by a rename during the hold)."""
+    # One lock for the sync and the drops: a writer change in between would
+    # let a drop strip the name the sync just gave the new writer.
+    with _shared_container_lock:
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        clusters = [cluster]
+        if global_cluster:
+            _sync_global_writer_endpoint_aliases(global_cluster)
+            for member in global_cluster.get("GlobalClusterMembers", []):
+                other = _resolve_global_member_cluster(member)
+                if other is not None and other is not cluster:
+                    clusters.append(other)
+        for target in clusters:
+            _drop_stale_global_writer_aliases(target)
+
+
+def _drop_stale_global_writer_aliases(cluster):
+    """Rejoin without global endpoints that are not its global cluster's current
+    name: one kept across a restart after the cluster left or renamed its global
+    cluster. Whether the current name belongs here is the sync's call, which
+    holds it on the old writer until the new one can take it."""
+    with _shared_container_lock:
+        if _cluster_container_starting(cluster):
+            return
+        global_cluster, _member = _global_cluster_member_for_cluster(cluster)
+        current = _global_cluster_endpoint(global_cluster) if global_cluster else None
+        found = _cluster_container_on_alias_network(cluster)
+        if not found:
+            return
+        aliases = _container_network_aliases(*found[1:])
+        stale = [a for a in aliases if a.endswith(_GLOBAL_ENDPOINT_SUFFIX) and a != current]
+        if not stale:
+            return
+        if any(instance.get("_pg_standby") for instance in _cluster_member_instances(cluster)):
+            logger.error(
+                "RDS: not dropping global endpoint %s from cluster %s: its readers "
+                "replicate from the current address",
+                ", ".join(stale), cluster.get("DBClusterIdentifier", "unknown"),
+            )
+            return
+        keeps_current = current in aliases
+        _rejoin_with_global_writer_alias(
+            cluster, current if keeps_current else ", ".join(stale), keeps_current, *found,
+        )
 
 
 def _next_port():
@@ -4637,7 +5036,12 @@ def _unregister_instance_from_clusters(db_id):
     """Remove instance from any cluster member list."""
     for cl in _clusters.values():
         mem = cl.get("DBClusterMembers") or []
-        cl["DBClusterMembers"] = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        kept = [m for m in mem if m.get("DBInstanceIdentifier") != db_id]
+        if len(kept) == len(mem):
+            # Another cluster's status must not change; a member of it may be
+            # mid-reboot, and nothing would restore its status afterward.
+            continue
+        cl["DBClusterMembers"] = kept
         _sync_cluster_endpoints(cl)
         _refresh_cluster_status(cl.get("DBClusterIdentifier"))
 
@@ -4881,7 +5285,7 @@ def _create_db_instance_impl(p):
                 container_kwargs = dict(
                     image=image, detach=True,
                     environment=env,
-                    ports={f"{container_port}/tcp": host_port},
+                    ports={f"{container_port}/tcp": container_reaper.published_port(host_port)},
                     name=_rds_docker_name(db_id),
                     labels={
                         **container_reaper.own_labels("rds"),
@@ -4909,11 +5313,13 @@ def _create_db_instance_impl(p):
                     _p(p, "BackupRetentionPeriod") or "1", param_group_name,
                 )):
                     container_kwargs["command"] = options
-                container = _run_rds_container(
-                    docker_client, engine, container_kwargs,
-                    tls_names=[endpoint_host or "",
-                               container_kwargs.get("name") or ""],
-                )
+                container, host_port = container_reaper.run_on_free_port(
+                    docker_client, lambda kwargs: _run_rds_container(
+                        docker_client, engine, kwargs,
+                        tls_names=[endpoint_host or "",
+                                   kwargs.get("name") or ""],
+                    ), container_kwargs, _next_port)
+                endpoint_port = host_port
                 docker_container_id = container.id
                 real_container_started = True
                 if ms_network:
@@ -4983,7 +5389,7 @@ def _create_db_instance_impl(p):
         "_HostPort": host_port,
         "AllocatedStorage": allocated_storage,
         "InstanceCreateTime": _format_time(now_ts),
-        "PreferredBackupWindow": "03:00-04:00",
+        "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "DBSecurityGroups": [],
         "VpcSecurityGroups": vpc_sg_list,
@@ -5005,7 +5411,7 @@ def _create_db_instance_impl(p):
         "LicenseModel": _license_model(engine),
         "Iops": int(_p(p, "Iops") or "0") if _p(p, "Iops") else None,
         "OptionGroupMemberships": [{
-            "OptionGroupName": f"default:{engine}-{engine_version.split('.')[0]}",
+            "OptionGroupName": _p(p, "OptionGroupName") or f"default:{engine}-{engine_version.split('.')[0]}",
             "Status": "in-sync",
         }],
         "CharacterSetName": "",
@@ -5020,7 +5426,7 @@ def _create_db_instance_impl(p):
         "StorageEncrypted": _p(p, "StorageEncrypted") == "true",
         "KmsKeyId": _p(p, "KmsKeyId") or "",
         "DbiResourceId": dbi_resource_id,
-        "CACertificateIdentifier": "rds-ca-rsa2048-g1",
+        "CACertificateIdentifier": _p(p, "CACertificateIdentifier") or "rds-ca-rsa2048-g1",
         "DomainMemberships": [],
         "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
         "MonitoringInterval": int(_p(p, "MonitoringInterval") or "0"),
@@ -5035,18 +5441,18 @@ def _create_db_instance_impl(p):
         "PerformanceInsightsRetentionPeriod": int(
             _p(p, "PerformanceInsightsRetentionPeriod") or "7"
         ),
-        "EnabledCloudwatchLogsExports": [],
-        "ProcessorFeatures": [],
+        "EnabledCloudwatchLogsExports": _parse_member_list(p, "EnableCloudwatchLogsExports"),
+        "ProcessorFeatures": _parse_processor_features(p),
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "AssociatedRoles": [],
         "TagList": [],
         "CustomerOwnedIpEnabled": False,
         "ActivityStreamStatus": "stopped",
         "BackupTarget": "region",
-        "NetworkType": "IPV4",
-        "StorageThroughput": 0,
+        "NetworkType": _p(p, "NetworkType") or "IPV4",
+        "StorageThroughput": int(_p(p, "StorageThroughput") or "0"),
         "CertificateDetails": {
-            "CAIdentifier": "rds-ca-rsa2048-g1",
+            "CAIdentifier": _p(p, "CACertificateIdentifier") or "rds-ca-rsa2048-g1",
             "ValidTill": "2061-01-01T00:00:00Z",
         },
         "IsStorageConfigUpgradeAvailable": False,
@@ -5060,6 +5466,10 @@ def _create_db_instance_impl(p):
     _set_performance_insights(instance, p)
     if parent and parent.get("_PerformanceInsightsManaged"):
         _inherit_performance_insights(instance, parent)
+    if _p(p, "EngineLifecycleSupport") or engine in ("mysql", "postgres"):
+        instance["EngineLifecycleSupport"] = _p(p, "EngineLifecycleSupport") or "open-source-rds-extended-support"
+    if _p(p, "DedicatedLogVolume"):
+        instance["DedicatedLogVolume"] = _p(p, "DedicatedLogVolume") == "true"
     # Only a request that turns storage autoscaling on sets the threshold.
     if _p(p, "MaxAllocatedStorage"):
         instance["MaxAllocatedStorage"] = int(_p(p, "MaxAllocatedStorage"))
@@ -5161,7 +5571,9 @@ def _create_db_instance_impl(p):
                 ready_host, ready_port, engine, readiness_user,
                 readiness_master_pass, readiness_db_name, _container_alive,
             )
-            if database_ready and _is_mysql_engine(engine):
+            if database_ready and _is_postgres_engine(engine):
+                _ensure_pg_iam_auth(container_id, engine, cluster_id or db_id)
+            elif database_ready and _is_mysql_engine(engine):
                 _ensure_mysql_compatibility(
                     container_id,
                     ready_host,
@@ -5199,6 +5611,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
 
                     cluster["_shared_storage_initialized"] = True
@@ -5213,6 +5626,7 @@ def _create_db_instance_impl(p):
                         cluster["_shared_container_ready"] = False
                         _set_cluster_members_status(cluster, "failed")
                         _refresh_cluster_status(cluster_id)
+                        _apply_deferred_global_writer_alias(cluster)
                         return
                     if pending_rotation:
                         cluster.pop("_pending_master_password_rotation", None)
@@ -5227,6 +5641,7 @@ def _create_db_instance_impl(p):
                             cluster_id, engine,
                         )
                     cluster["_shared_container_ready"] = True
+                    _apply_deferred_global_writer_alias(cluster)
                     if _aurora_mysql_8_replication_enabled(cluster):
                         _configure_or_defer_mysql_replication(cluster_id, cluster)
                     for member in cluster.get("DBClusterMembers", []):
@@ -5428,8 +5843,11 @@ def _describe_db_instances(p):
         docdb_members = documentdb.instance_members_xml(filters)
 
     members = "".join(f"<DBInstance>{_instance_xml(i)}</DBInstance>" for i in instances) + docdb_members
+    members, marker_xml, page_error = _records_page(p, members, "DBInstance")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBInstancesResponse",
-        f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances></DescribeDBInstancesResult>")
+        f"<DescribeDBInstancesResult><DBInstances>{members}</DBInstances>{marker_xml}</DescribeDBInstancesResult>")
 
 
 def _rotate_instance_password(instance, old_pass, new_pass):
@@ -5489,7 +5907,109 @@ def _rotate_instance_password(instance, old_pass, new_pass):
 _IMMEDIATE_INSTANCE_SETTINGS = frozenset({
     "DeletionProtection", "CopyTagsToSnapshot", "PreferredBackupWindow", "PreferredMaintenanceWindow",
     "PubliclyAccessible", "MaxAllocatedStorage", "MonitoringInterval", "MonitoringRoleArn",
+    "AutoMinorVersionUpgrade", "NetworkType", "PromotionTier", "EngineLifecycleSupport",
 })
+
+
+def _parse_processor_features(params, prefix="ProcessorFeatures"):
+    for member in ("ProcessorFeature", "member"):
+        features, i = [], 1
+        while _p(params, f"{prefix}.{member}.{i}.Name"):
+            features.append({"Name": _p(params, f"{prefix}.{member}.{i}.Name"),
+                             "Value": _p(params, f"{prefix}.{member}.{i}.Value")})
+            i += 1
+        if features:
+            return features
+    return []
+
+
+def _apply_logs_export_configuration(resource, params):
+    enable = _parse_member_list(params, "CloudwatchLogsExportConfiguration.EnableLogTypes")
+    disable = set(_parse_member_list(params, "CloudwatchLogsExportConfiguration.DisableLogTypes"))
+    if not enable and not disable:
+        return
+    current = [t for t in resource.get("EnabledCloudwatchLogsExports") or [] if t not in disable]
+    resource["EnabledCloudwatchLogsExports"] = current + [t for t in enable if t not in current and t not in disable]
+
+
+def _subnet_group_record(name):
+    return _subnet_groups.get(name, {
+        "DBSubnetGroupName": name,
+        "DBSubnetGroupDescription": "default",
+        "SubnetGroupStatus": "Complete",
+        "Subnets": [],
+        "VpcId": "vpc-00000000",
+        "DBSubnetGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:subgrp:{name}",
+    })
+
+
+def _apply_instance_request_overrides(instance, p):
+    """Request fields CreateDBInstanceReadReplica and RestoreDBInstanceFromDBSnapshot set on the new instance."""
+    for param, key, kind in (
+        ("DBInstanceClass", "DBInstanceClass", str), ("AvailabilityZone", "AvailabilityZone", str),
+        ("MultiAZ", "MultiAZ", bool), ("StorageType", "StorageType", str), ("Iops", "Iops", int),
+        ("AllocatedStorage", "AllocatedStorage", int), ("StorageThroughput", "StorageThroughput", int),
+        ("PubliclyAccessible", "PubliclyAccessible", bool), ("KmsKeyId", "KmsKeyId", str),
+        ("MonitoringInterval", "MonitoringInterval", int), ("MonitoringRoleArn", "MonitoringRoleArn", str),
+        ("EnableIAMDatabaseAuthentication", "IAMDatabaseAuthenticationEnabled", bool),
+        ("DeletionProtection", "DeletionProtection", bool), ("CopyTagsToSnapshot", "CopyTagsToSnapshot", bool),
+        ("AutoMinorVersionUpgrade", "AutoMinorVersionUpgrade", bool), ("NetworkType", "NetworkType", str),
+        ("DedicatedLogVolume", "DedicatedLogVolume", bool), ("EngineLifecycleSupport", "EngineLifecycleSupport", str),
+        ("LicenseModel", "LicenseModel", str), ("BackupRetentionPeriod", "BackupRetentionPeriod", int),
+        ("PreferredBackupWindow", "PreferredBackupWindow", str),
+    ):
+        val = _p(p, param)
+        if val:
+            instance[key] = val == "true" if kind is bool else kind(val)
+    if _p(p, "Port"):
+        instance["Endpoint"] = {**instance.get("Endpoint", {}), "Port": int(_p(p, "Port"))}
+    if _p(p, "CACertificateIdentifier"):
+        instance["CACertificateIdentifier"] = _p(p, "CACertificateIdentifier")
+        instance["CertificateDetails"] = {**instance.get("CertificateDetails", {"ValidTill": "2061-01-01T00:00:00Z"}),
+                                          "CAIdentifier": _p(p, "CACertificateIdentifier")}
+    if _p(p, "DBSubnetGroupName"):
+        instance["DBSubnetGroup"] = _subnet_group_record(_p(p, "DBSubnetGroupName"))
+    if _p(p, "DBParameterGroupName"):
+        instance["DBParameterGroups"] = [{"DBParameterGroupName": _p(p, "DBParameterGroupName"),
+                                          "ParameterApplyStatus": "in-sync"}]
+    if _p(p, "OptionGroupName"):
+        instance["OptionGroupMemberships"] = [{"OptionGroupName": _p(p, "OptionGroupName"), "Status": "in-sync"}]
+    vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
+    if vpc_sgs:
+        instance["VpcSecurityGroups"] = [{"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs]
+    logs = _parse_member_list(p, "EnableCloudwatchLogsExports")
+    if logs:
+        instance["EnabledCloudwatchLogsExports"] = logs
+    features = _parse_processor_features(p)
+    if features:
+        instance["ProcessorFeatures"] = features
+    _set_performance_insights(instance, p)
+
+
+def _rename_db_instance(instance, new_id):
+    old_id = instance["DBInstanceIdentifier"]
+    old_arn = instance["DBInstanceArn"]
+    new_arn = f"{old_arn.rsplit(':', 1)[0]}:{new_id}"
+    del _instances[old_id]
+    instance["DBInstanceIdentifier"] = new_id
+    instance["DBInstanceArn"] = new_arn
+    if instance.get("_docker_container_id"):
+        # Respawn after restart must clear the container still named for the old identifier.
+        instance["_legacy_docker_container_name"] = _rds_docker_name(old_id)
+    _instances[new_id] = instance
+    if old_arn in _tags:
+        _tags[new_arn] = _tags.pop(old_arn)
+    for other in _instances.values():
+        replicas = other.get("ReadReplicaDBInstanceIdentifiers") or []
+        if old_id in replicas:
+            other["ReadReplicaDBInstanceIdentifiers"] = [new_id if r == old_id else r for r in replicas]
+        if other.get("ReadReplicaSourceDBInstanceIdentifier") == old_id:
+            other["ReadReplicaSourceDBInstanceIdentifier"] = new_id
+    cluster_id = instance.get("DBClusterIdentifier")
+    cluster = _resolve_cluster_in_request_region(cluster_id) if cluster_id else None
+    for member in (cluster or {}).get("DBClusterMembers") or []:
+        if member.get("DBInstanceIdentifier") == old_id:
+            member["DBInstanceIdentifier"] = new_id
 
 
 def _modify_db_instance(p):
@@ -5524,6 +6044,15 @@ def _modify_db_instance(p):
 
     apply_immediately = _p(p, "ApplyImmediately") == "true"
 
+    new_id = _p(p, "NewDBInstanceIdentifier").lower()
+    if new_id == instance["DBInstanceIdentifier"]:
+        new_id = ""
+    prior_pending = dict(instance.get("PendingModifiedValues") or {})
+    if apply_immediately and not new_id:
+        new_id = prior_pending.get("DBInstanceIdentifier", "")
+    if new_id and new_id in _instances:
+        return _error("DBInstanceAlreadyExists", f"DBInstance {new_id} already exists.", 400)
+
     field_map = {
         "DBInstanceClass": "DBInstanceClass",
         "AllocatedStorage": "AllocatedStorage",
@@ -5543,13 +6072,28 @@ def _modify_db_instance(p):
         "MonitoringInterval": "MonitoringInterval",
         "MonitoringRoleArn": "MonitoringRoleArn",
         "CopyTagsToSnapshot": "CopyTagsToSnapshot",
+        "AutoMinorVersionUpgrade": "AutoMinorVersionUpgrade",
+        "LicenseModel": "LicenseModel",
+        "StorageThroughput": "StorageThroughput",
+        "NetworkType": "NetworkType",
+        "PromotionTier": "PromotionTier",
+        "EngineLifecycleSupport": "EngineLifecycleSupport",
+        "DedicatedLogVolume": "DedicatedLogVolume",
         # Aurora members take it from the DB cluster.
         "EnableIAMDatabaseAuthentication": (
             None if instance.get("DBClusterIdentifier") else "IAMDatabaseAuthenticationEnabled"
         ),
     }
 
-    pending = {}
+    # ApplyImmediately applies "the modifications in this request and any pending modifications".
+    if apply_immediately and prior_pending:
+        prior_pending.pop("DBInstanceIdentifier", None)
+        prior_subnet = prior_pending.pop("DBSubnetGroupName", None)
+        if prior_subnet:
+            instance["DBSubnetGroup"] = _subnet_group_record(prior_subnet)
+        instance.update(prior_pending)
+        prior_pending = {}
+    pending = dict(prior_pending)
     for param_key, instance_key in field_map.items():
         val = _p(p, param_key)
         if not val:
@@ -5557,15 +6101,18 @@ def _modify_db_instance(p):
         if instance_key is None:
             continue
         if param_key in ("AllocatedStorage", "BackupRetentionPeriod",
-                         "MonitoringInterval", "Iops", "MaxAllocatedStorage"):
+                         "MonitoringInterval", "Iops", "MaxAllocatedStorage",
+                         "StorageThroughput", "PromotionTier"):
             val = int(val)
         elif param_key in ("MultiAZ", "PubliclyAccessible", "DeletionProtection",
-                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication"):
+                           "CopyTagsToSnapshot", "EnableIAMDatabaseAuthentication",
+                           "AutoMinorVersionUpgrade", "DedicatedLogVolume"):
             val = val == "true"
 
         # Not PendingModifiedValues members: AWS applies these whatever ApplyImmediately says.
         if apply_immediately or param_key in _IMMEDIATE_INSTANCE_SETTINGS:
             instance[instance_key] = val
+            pending.pop(instance_key, None)
         else:
             pending[instance_key] = val
     # A threshold equal to the allocated storage turns storage autoscaling off.
@@ -5589,8 +6136,33 @@ def _modify_db_instance(p):
             {"VpcSecurityGroupId": sg, "Status": "active"} for sg in vpc_sgs
         ]
 
-    if pending:
-        instance["PendingModifiedValues"] = pending
+    if _p(p, "PromotionTier") and instance.get("DBClusterIdentifier"):
+        cluster = _resolve_cluster_in_request_region(instance["DBClusterIdentifier"])
+        for member in (cluster or {}).get("DBClusterMembers") or []:
+            if member.get("DBInstanceIdentifier") == instance["DBInstanceIdentifier"]:
+                member["PromotionTier"] = instance["PromotionTier"]
+    if _p(p, "OptionGroupName"):
+        instance["OptionGroupMemberships"] = [{"OptionGroupName": _p(p, "OptionGroupName"), "Status": "in-sync"}]
+    # AWS restarts the database on a port change whatever ApplyImmediately says. A
+    # container-backed instance keeps listening where it was started, so only stubs move.
+    if _p(p, "DBPortNumber") and not instance.get("_docker_container_id"):
+        instance["Endpoint"] = {**instance.get("Endpoint", {}), "Port": int(_p(p, "DBPortNumber"))}
+    if _p(p, "DBSubnetGroupName"):
+        if apply_immediately:
+            instance["DBSubnetGroup"] = _subnet_group_record(_p(p, "DBSubnetGroupName"))
+        else:
+            pending["DBSubnetGroupName"] = _p(p, "DBSubnetGroupName")
+    _apply_logs_export_configuration(instance, p)
+    if not instance.get("DBClusterIdentifier"):
+        _set_performance_insights(instance, p)
+
+    instance["PendingModifiedValues"] = pending
+    if new_id:
+        if apply_immediately:
+            instance.get("PendingModifiedValues", {}).pop("DBInstanceIdentifier", None)
+            _rename_db_instance(instance, new_id)
+        else:
+            instance.setdefault("PendingModifiedValues", {})["DBInstanceIdentifier"] = new_id
 
     return _single_instance_response("ModifyDBInstanceResponse", "ModifyDBInstanceResult", instance)
 
@@ -5732,6 +6304,60 @@ def _describe_events(p):
     return _xml(200, "DescribeEventsResponse", f"<DescribeEventsResult><Events>{members}</Events>{next_marker}</DescribeEventsResult>")
 
 
+def _reboot_credentials(instance, cluster):
+    """Credentials the restarted database accepts.
+
+    A cluster member copies the master password when it attaches, but
+    ModifyDBCluster updates only the cluster. Reading the member's copy after a
+    rotation never authenticates, so the reboot never completes. A rotation
+    still pending has not reached the database, which keeps the old password.
+    """
+    user = instance.get("MasterUsername", "root")
+    password = instance.get("_MasterUserPassword", "password")
+    if cluster:
+        user = cluster.get("MasterUsername", user)
+        pending = cluster.get("_pending_master_password_rotation")
+        password = pending["old_password"] if pending else cluster.get("_MasterUserPassword", password)
+    return user, password
+
+
+def _refresh_restarted_container_address(client, container, instance, cluster):
+    """Record the address Docker gave a restarted container.
+
+    Docker can assign a new IP on restart, so every record backed by this
+    container (the instance, a shared cluster container and its other members)
+    moves to the new address. Records are matched by container, not by the old
+    IP: containers restarting together can trade addresses.
+    """
+    ms_network = _get_ministack_network(client)
+    if not ms_network:
+        return
+    container.reload()
+    networks = (getattr(container, "attrs", None) or {}).get("NetworkSettings", {}).get("Networks", {})
+    new_ip = networks.get(ms_network, {}).get("IPAddress", "")
+    old_ip = instance.get("_internal_address")
+    if not new_ip or not old_ip or new_ip == old_ip:
+        return
+    container_id = instance.get("_docker_container_id")
+    records = [i for i in _instances.values()
+               if container_id and i.get("_docker_container_id") == container_id and i.get("_internal_address") == old_ip]
+    if instance not in records:
+        records.append(instance)
+    for record in records:
+        record["_internal_address"] = new_ip
+        endpoint = record.get("Endpoint")
+        if isinstance(endpoint, dict) and endpoint.get("Address") == old_ip:
+            endpoint["Address"] = new_ip
+    if cluster and cluster.get("_shared_internal_address") == old_ip:
+        cluster["_shared_internal_address"] = new_ip
+        endpoint = cluster.get("_shared_endpoint")
+        if isinstance(endpoint, dict) and endpoint.get("Address") == old_ip:
+            endpoint["Address"] = new_ip
+        # Outside alias mode the published cluster endpoints are addresses too.
+        _sync_cluster_endpoints(cluster)
+    logger.info("RDS: %s restarted at %s (was %s)", instance.get("DBInstanceIdentifier"), new_ip, old_ip)
+
+
 def _finish_instance_reboot(instance, cluster):
     db_id = instance["DBInstanceIdentifier"]
 
@@ -5743,10 +6369,12 @@ def _finish_instance_reboot(instance, cluster):
         container_id = instance.get("_docker_container_id")
         if client and container_id:
             container = client.containers.get(container_id)
+            user, password = _reboot_credentials(instance, cluster)
             container.stop(timeout=5)
             if not current():
                 return
             container.start()
+            _refresh_restarted_container_address(client, container, instance, cluster)
 
             def alive():
                 if not current():
@@ -5759,8 +6387,7 @@ def _finish_instance_reboot(instance, cluster):
             port = instance.get("_internal_port") or instance.get("_HostPort") or endpoint.get("Port")
             if not _wait_for_database_ready(
                 host, port, instance.get("Engine", "mysql"),
-                instance.get("MasterUsername", "root"),
-                instance.get("_MasterUserPassword", "password"),
+                user, password,
                 instance.get("DBName"), alive,
             ):
                 raise RuntimeError("database stopped before reboot readiness")
@@ -5774,6 +6401,8 @@ def _finish_instance_reboot(instance, cluster):
     finally:
         if cluster:
             _end_mysql_global_instance_mutation(cluster)
+            _apply_deferred_global_writer_alias(cluster)
+            _refresh_cluster_status(cluster.get("DBClusterIdentifier"))
 
 
 # ---------------------------------------------------------------------------
@@ -5815,6 +6444,7 @@ def _create_read_replica(p):
         "TagList": [],
         "_docker_container_id": None,
     })
+    _apply_instance_request_overrides(replica, p)
     _instances[replica_id] = replica
     source.setdefault("ReadReplicaDBInstanceIdentifiers", []).append(replica_id)
 
@@ -5895,6 +6525,7 @@ def _restore_from_snapshot(p):
         "TagList": [],
         "_docker_container_id": None,
     }
+    _apply_instance_request_overrides(instance, p)
     _instances[db_id] = instance
     return _single_instance_response("RestoreDBInstanceFromDBSnapshotResponse",
                                      "RestoreDBInstanceFromDBSnapshotResult", instance)
@@ -5958,6 +6589,16 @@ def _serverlessv2_from_params(p):
         if raw not in (None, ""):
             out[field] = float(raw)
     return out or None
+
+
+def _apply_cluster_request_fields(cluster, p):
+    for param, kind in (("Iops", int), ("AutoMinorVersionUpgrade", bool), ("MonitoringInterval", int),
+                        ("MonitoringRoleArn", str), ("BacktrackWindow", int)):
+        if _p(p, param):
+            cluster[param] = _p(p, param) == "true" if kind is bool else kind(_p(p, param))
+    if _p(p, "EnableLocalWriteForwarding"):
+        cluster["LocalWriteForwardingStatus"] = (
+            "enabled" if _p(p, "EnableLocalWriteForwarding") == "true" else "disabled")
 
 
 def _create_db_cluster(p):
@@ -6157,7 +6798,8 @@ def _create_db_cluster_impl(p):
         "DBClusterMembers": [],
         "VpcSecurityGroups": vpc_sg_list,
         "DBSubnetGroup": _p(p, "DBSubnetGroupName") or "default",
-        "DBClusterParameterGroup": _p(p, "DBClusterParameterGroupName") or f"default.{engine}",
+        "DBClusterParameterGroup": (_p(p, "DBClusterParameterGroupName")
+                                    or f"default.{_aurora_cluster_family(engine, engine_version) or engine}"),
         "BackupRetentionPeriod": int(_p(p, "BackupRetentionPeriod") or "1"),
         "PreferredBackupWindow": _p(p, "PreferredBackupWindow") or "03:00-04:00",
         "PreferredMaintenanceWindow": _p(p, "PreferredMaintenanceWindow") or "sun:05:00-sun:06:00",
@@ -6168,7 +6810,7 @@ def _create_db_cluster_impl(p):
         "KmsKeyId": _p(p, "KmsKeyId") or "",
         "DeletionProtection": _p(p, "DeletionProtection") == "true",
         "IAMDatabaseAuthenticationEnabled": _p(p, "EnableIAMDatabaseAuthentication") == "true",
-        "EnabledCloudwatchLogsExports": [],
+        "EnabledCloudwatchLogsExports": _parse_member_list(p, "EnableCloudwatchLogsExports"),
         "HttpEndpointEnabled": _p(p, "EnableHttpEndpoint") == "true",
         "CopyTagsToSnapshot": _p(p, "CopyTagsToSnapshot") == "true",
         "CrossAccountClone": False,
@@ -6194,7 +6836,21 @@ def _create_db_cluster_impl(p):
     if _set_performance_insights(cluster, p):
         cluster["_PerformanceInsightsManaged"] = True
         cluster["DatabaseInsightsMode"] = "standard"
+    if _p(p, "StorageType") or engine.startswith("aurora"):
+        cluster["StorageType"] = _p(p, "StorageType") or "aurora"
+    _apply_cluster_request_fields(cluster, p)
     _prepare_mysql_gtid_history(cluster)
+    if (RDS_PUBLIC_ENDPOINT and _get_docker()
+            and _docker_image_for_engine(engine, engine_version, master_user, master_pass, "mydb")[0]):
+        # Report the published endpoint from create on; the container reuses this port.
+        host_port = _next_port()
+        cluster.update({
+            "_shared_host_port": host_port,
+            "Endpoint": _MINISTACK_HOST,
+            "ReaderEndpoint": _MINISTACK_HOST,
+            "Port": host_port,
+        })
+    _cluster_param_group(cluster["DBClusterParameterGroup"])  # a default group exists once a cluster uses it
     _clusters[cluster_id] = cluster
     if global_cluster:
         is_first_member = not global_cluster.get("GlobalClusterMembers")
@@ -6278,6 +6934,32 @@ def _delete_db_cluster(p):
         f"<DeleteDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></DeleteDBClusterResult>")
 
 
+def _password_reset_view(c, advance):
+    """*c* as AWS shows it during a master password reset: pending, then resetting, then settled, one describe each.
+    ``_password_reset_describes`` is only reassigned (3 = settled), never popped, for concurrent get_state()."""
+    seen = c.get("_password_reset_describes")
+    if seen is None or seen > 2:
+        return c
+    if advance:
+        c["_password_reset_describes"] = seen + 1
+        if seen == 2:
+            return c
+    view = {**c, "PendingModifiedValues": {"MasterUserPassword": "****"}}
+    if advance and seen == 1 and c.get("Status") == "available":
+        view["Status"] = "resetting-master-credentials"
+    return view
+
+
+def _cluster_view(c, advance):
+    """*c* with both a pending password reset and a pending major upgrade shown. Each view
+    advances the stored cluster, so both run on it and their changes are merged."""
+    upgrade, reset = _upgrade_view(c, advance), _password_reset_view(c, advance)
+    if reset is c:
+        return upgrade
+    return {**upgrade, "Status": reset["Status"] if reset["Status"] != c.get("Status") else upgrade["Status"],
+            "PendingModifiedValues": {**(upgrade.get("PendingModifiedValues") or {}), **reset["PendingModifiedValues"]}}
+
+
 def _describe_db_clusters(p):
     cluster_id = _p(p, "DBClusterIdentifier")
     if cluster_id:
@@ -6297,9 +6979,12 @@ def _describe_db_clusters(p):
         from ministack.services import documentdb
         docdb_members = documentdb.cluster_members_xml(filters)
 
-    members = "".join(f"<DBCluster>{_cluster_xml(c)}</DBCluster>" for c in clusters) + docdb_members
+    members = "".join(f"<DBCluster>{_cluster_xml(_cluster_view(c, True))}</DBCluster>" for c in clusters) + docdb_members
+    members, marker_xml, page_error = _records_page(p, members, "DBCluster")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClustersResponse",
-        f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters></DescribeDBClustersResult>")
+        f"<DescribeDBClustersResult><DBClusters>{members}</DBClusters>{marker_xml}</DescribeDBClustersResult>")
 
 
 def _generate_master_user_password():
@@ -6490,6 +7175,13 @@ def _modify_db_cluster_impl(p):
     )
     if global_version_conflict:
         return global_version_conflict
+    old_family = _aurora_cluster_family(cluster.get("Engine"), cluster.get("EngineVersion"))
+    new_family = _aurora_cluster_family(cluster.get("Engine"), engine_version)
+    if (old_family and new_family and old_family != new_family
+            and _p(p, "AllowMajorVersionUpgrade").lower() != "true"):
+        # AWS Aurora user guide, in-place upgrade tutorial.
+        return _error("InvalidParameterCombination",
+                      "The AllowMajorVersionUpgrade flag must be present when upgrading to a new major version.", 400)
     if _p(p, "MasterUserPassword"):
         if cluster.get("MasterUserSecret"):
             return _error(
@@ -6504,7 +7196,16 @@ def _modify_db_cluster_impl(p):
                 "MasterUserPassword must be changed on the global writer.",
                 400,
             )
+        if cluster.get("Status") == "stopped":
+            # Verbatim from real AWS (captured, us-west-2).
+            return _error(
+                "InvalidDBClusterStateFault",
+                f"Db cluster {cluster_id} cannot be in the stopped state.",
+                400,
+            )
         _apply_cluster_master_password_change(cluster, _p(p, "MasterUserPassword"))
+        if cluster.get("Status") == "available":
+            cluster["_password_reset_describes"] = 0
     if _p(p, "RotateMasterUserPassword") == "true":
         master_user_secret = cluster.get("MasterUserSecret")
         if not master_user_secret:
@@ -6541,7 +7242,7 @@ def _modify_db_cluster_impl(p):
             )
         _apply_cluster_master_password_change(cluster, new_pass)
     if engine_version:
-        cluster["EngineVersion"] = engine_version
+        _set_cluster_engine_version(cluster, engine_version)
     if _p(p, "Port"):
         cluster["Port"] = int(_p(p, "Port"))
     if _p(p, "BackupRetentionPeriod"):
@@ -6566,6 +7267,15 @@ def _modify_db_cluster_impl(p):
         cluster["CopyTagsToSnapshot"] = _p(p, "CopyTagsToSnapshot") == "true"
     if _p(p, "DBClusterParameterGroupName"):
         cluster["DBClusterParameterGroup"] = _p(p, "DBClusterParameterGroupName")
+        _cluster_param_group(cluster["DBClusterParameterGroup"])
+    if _p(p, "StorageType"):
+        cluster["StorageType"] = _p(p, "StorageType")
+    if _p(p, "NetworkType"):
+        cluster["NetworkType"] = _p(p, "NetworkType")
+    if _p(p, "EngineLifecycleSupport"):
+        cluster["EngineLifecycleSupport"] = _p(p, "EngineLifecycleSupport")
+    _apply_cluster_request_fields(cluster, p)
+    _apply_logs_export_configuration(cluster, p)
 
     vpc_sgs = _parse_member_list(p, "VpcSecurityGroupIds")
     if vpc_sgs:
@@ -6581,7 +7291,7 @@ def _modify_db_cluster_impl(p):
                 _inherit_performance_insights(instance, cluster)
 
     return _xml(200, "ModifyDBClusterResponse",
-        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(cluster)}</DBCluster></ModifyDBClusterResult>")
+        f"<ModifyDBClusterResult><DBCluster>{_cluster_xml(_cluster_view(cluster, False))}</DBCluster></ModifyDBClusterResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6688,8 +7398,11 @@ def _describe_db_snapshots(p):
             snaps = [s for s in snaps if s["SnapshotType"] == snap_type]
 
     members = "".join(f"<DBSnapshot>{_snapshot_xml(s)}</DBSnapshot>" for s in snaps)
+    members, marker_xml, page_error = _records_page(p, members, "DBSnapshot")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBSnapshotsResponse",
-        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots></DescribeDBSnapshotsResult>")
+        f"<DescribeDBSnapshotsResult><DBSnapshots>{members}</DBSnapshots>{marker_xml}</DescribeDBSnapshotsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6779,8 +7492,11 @@ def _describe_subnet_groups(p):
     members = "".join(
         f"<DBSubnetGroup>{_subnet_group_xml(g)}</DBSubnetGroup>" for g in groups
     )
+    members, marker_xml, page_error = _records_page(p, members, "DBSubnetGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBSubnetGroupsResponse",
-        f"<DescribeDBSubnetGroupsResult><DBSubnetGroups>{members}</DBSubnetGroups></DescribeDBSubnetGroupsResult>")
+        f"<DescribeDBSubnetGroupsResult><DBSubnetGroups>{members}</DBSubnetGroups>{marker_xml}</DescribeDBSubnetGroupsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6843,8 +7559,11 @@ def _describe_param_groups(p):
         <Description>{_esc(g['Description'])}</Description>
         <DBParameterGroupArn>{g.get('DBParameterGroupArn','')}</DBParameterGroupArn>
     </DBParameterGroup>""" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "DBParameterGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBParameterGroupsResponse",
-        f"<DescribeDBParameterGroupsResult><DBParameterGroups>{members}</DBParameterGroups></DescribeDBParameterGroupsResult>")
+        f"<DescribeDBParameterGroupsResult><DBParameterGroups>{members}</DBParameterGroups>{marker_xml}</DescribeDBParameterGroupsResult>")
 
 
 def _describe_db_parameters(p):
@@ -6855,9 +7574,11 @@ def _describe_db_parameters(p):
 
     source_filter = _p(p, "Source")  # "user", "engine-default", or None (all)
     params_xml = _parameter_group_parameters_xml(pg, source_filter)
-
+    params_xml, marker_xml, page_error = _records_page(p, params_xml, "Parameter")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBParametersResponse",
-        f"<DescribeDBParametersResult><Parameters>{params_xml}</Parameters></DescribeDBParametersResult>")
+        f"<DescribeDBParametersResult><Parameters>{params_xml}</Parameters>{marker_xml}</DescribeDBParametersResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -6959,10 +7680,103 @@ def _create_db_cluster_param_group(p):
         </DBClusterParameterGroup></CreateDBClusterParameterGroupResult>""")
 
 
+def _upgrade_view(c, advance):
+    """*c* as AWS shows it during a major upgrade: old version pending, then upgrading (stored), then settled."""
+    pending = c.get("_major_upgrade_pending")
+    if pending is None:
+        return c
+    if advance:
+        if pending["seen"]:
+            c.pop("_major_upgrade_pending", None)  # concurrent describes may both settle it
+            if c.get("Status") == "upgrading":
+                c["Status"] = "available"
+                _refresh_cluster_status(c.get("DBClusterIdentifier"))  # members restarting after a restore
+            return c
+        pending["seen"] = 1
+        if c.get("Status") == "available":
+            c["Status"] = "upgrading"
+    view = {**c, "EngineVersion": pending["EngineVersion"],
+            "PendingModifiedValues": {"EngineVersion": c["EngineVersion"]}}
+    if pending["DBClusterParameterGroup"]:
+        view["DBClusterParameterGroup"] = pending["DBClusterParameterGroup"]
+    return view
+
+
+def _aurora_cluster_family(engine, engine_version):
+    """The DB parameter group family AWS reports for an Aurora engine version, or None."""
+    catalog = {"aurora-mysql": AURORA_MYSQL_ENGINE_VERSIONS,
+               "aurora-postgresql": AURORA_POSTGRESQL_ENGINE_VERSIONS}.get(engine, [])
+    # A dot-boundary prefix ("17", "8.0") resolves to the family of the versions it prefixes.
+    return next((fam for ver, fam in catalog
+                 if engine_version and (ver == engine_version or ver.startswith(engine_version + "."))), None)
+
+
+def _set_cluster_engine_version(cluster, engine_version):
+    """Set a cluster's engine version; a major upgrade moves default groups to the new family's."""
+    old_version, old_group = cluster.get("EngineVersion"), cluster.get("DBClusterParameterGroup")
+    engine = cluster.get("Engine")
+    old_family = _aurora_cluster_family(engine, old_version)
+    new_family = _aurora_cluster_family(engine, engine_version)
+    major = bool(new_family and old_family and new_family != old_family)
+    if major and old_group and old_group == f"default.{old_family}":
+        cluster["DBClusterParameterGroup"] = f"default.{new_family}"
+    cluster["EngineVersion"] = engine_version
+    if not major:
+        return
+    # A global member may live in another Region or account than this request.
+    arn = _parse_rds_arn(cluster.get("DBClusterArn", ""))
+    with request_scope(arn[0].account_id, arn[0].region) if arn else contextlib.nullcontext():
+        _cluster_param_group(cluster.get("DBClusterParameterGroup"))
+        old_instance_defaults = {f"default.{old_family}", f"default.{engine}{(old_version or '').split('.')[0]}"}
+        for instance in _instances.values():
+            if instance.get("DBClusterIdentifier") != cluster.get("DBClusterIdentifier"):
+                continue
+            instance["EngineVersion"] = engine_version
+            groups = instance.get("DBParameterGroups") or []
+            if groups and groups[0].get("DBParameterGroupName") in old_instance_defaults:
+                groups[0]["DBParameterGroupName"] = f"default.{new_family}"
+    cluster["_major_upgrade_pending"] = {
+        "seen": 0, "EngineVersion": old_version, "DBClusterParameterGroup": old_group}
+
+
+def _default_cluster_param_group(family):
+    name = f"default.{family}"
+    return {
+        "DBClusterParameterGroupName": name,
+        "DBParameterGroupFamily": family,
+        "Description": f"Default cluster parameter group for {family}",
+        "DBClusterParameterGroupArn": f"arn:aws:rds:{get_region()}:{get_account_id()}:cluster-pg:{name}",
+        "Parameters": {},
+    }
+
+
+def _cluster_param_group(name):
+    """AWS has a default cluster parameter group per Aurora family; it joins the account once described or used."""
+    pg = _db_cluster_param_groups.get(name)
+    if pg or not _is_default_cluster_param_group(name):
+        return pg
+    pg = _db_cluster_param_groups[name] = _default_cluster_param_group(name[len("default."):])
+    return pg
+
+
+def _is_default_cluster_param_group(name):
+    return bool(name) and name.startswith("default.") and name[len("default."):] in {
+        f for _, f in AURORA_MYSQL_ENGINE_VERSIONS + AURORA_POSTGRESQL_ENGINE_VERSIONS}
+
+
+def _default_cluster_param_group_refusal(name, action):
+    """AWS refuses to modify or delete a default cluster parameter group (captured); a reset succeeds."""
+    if not _is_default_cluster_param_group(name):
+        return None
+    if action == "modify":
+        return _error("InvalidParameterValue", "Cannot modify a default parameter group.", 400)
+    return _error("InvalidDBParameterGroupState", f"Default DBClusterParameterGroup cannot be deleted: {name}", 400)
+
+
 def _describe_db_cluster_param_groups(p):
     name = _p(p, "DBClusterParameterGroupName")
     if name:
-        pg = _db_cluster_param_groups.get(name)
+        pg = _cluster_param_group(name)
         if not pg:
             return _error("DBParameterGroupNotFound",
                 f"DB cluster parameter group {name} not found.", 404)
@@ -6976,16 +7790,20 @@ def _describe_db_cluster_param_groups(p):
         <Description>{_esc(g['Description'])}</Description>
         <DBClusterParameterGroupArn>{g.get('DBClusterParameterGroupArn','')}</DBClusterParameterGroupArn>
     </DBClusterParameterGroup>""" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "DBClusterParameterGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterParameterGroupsResponse",
-        f"<DescribeDBClusterParameterGroupsResult><DBClusterParameterGroups>{members}</DBClusterParameterGroups></DescribeDBClusterParameterGroupsResult>")
+        f"<DescribeDBClusterParameterGroupsResult><DBClusterParameterGroups>{members}</DBClusterParameterGroups>{marker_xml}</DescribeDBClusterParameterGroupsResult>")
 
 
 def _delete_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if refusal := _default_cluster_param_group_refusal(name, "delete"):
+        return refusal
     pg = _db_cluster_param_groups.pop(name, None)
     if not pg:
-        return _error("DBParameterGroupNotFound",
-            f"DB cluster parameter group {name} not found.", 404)
+        return _error("DBParameterGroupNotFound", f"DBClusterParameterGroup not found: {name}", 404)
     _tags.pop(pg.get("DBClusterParameterGroupArn", ""), None)
     return _xml(200, "DeleteDBClusterParameterGroupResponse", "")
 
@@ -6993,17 +7811,22 @@ def _delete_db_cluster_param_group(p):
 def _describe_db_cluster_parameters(p):
     name = _p(p, "DBClusterParameterGroupName")
     source_filter = _p(p, "Source")
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
     members = _parameter_group_parameters_xml(pg, source_filter)
+    members, marker_xml, page_error = _records_page(p, members, "Parameter")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterParametersResponse",
-        f"<DescribeDBClusterParametersResult><Parameters>{members}</Parameters></DescribeDBClusterParametersResult>")
+        f"<DescribeDBClusterParametersResult><Parameters>{members}</Parameters>{marker_xml}</DescribeDBClusterParametersResult>")
 
 
 def _modify_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
+    if refusal := _default_cluster_param_group_refusal(name, "modify"):
+        return refusal
     pg = _db_cluster_param_groups.get(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
@@ -7025,7 +7848,7 @@ def _modify_db_cluster_param_group(p):
 
 def _reset_db_cluster_param_group(p):
     name = _p(p, "DBClusterParameterGroupName")
-    pg = _db_cluster_param_groups.get(name)
+    pg = _cluster_param_group(name)
     if not pg:
         return _error("DBParameterGroupNotFound",
             f"DB cluster parameter group {name} not found.", 404)
@@ -7148,8 +7971,11 @@ def _describe_db_cluster_snapshots(p):
 
     members = "".join(
         f"<DBClusterSnapshot>{_cluster_snapshot_xml(s)}</DBClusterSnapshot>" for s in snaps)
+    members, marker_xml, page_error = _records_page(p, members, "DBClusterSnapshot")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBClusterSnapshotsResponse",
-        f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots></DescribeDBClusterSnapshotsResult>")
+        f"<DescribeDBClusterSnapshotsResult><DBClusterSnapshots>{members}</DBClusterSnapshots>{marker_xml}</DescribeDBClusterSnapshotsResult>")
 
 
 def _describe_db_cluster_snapshot_attributes(p):
@@ -7436,7 +8262,9 @@ def _start_db_cluster(p):
             ready_host, ready_port, engine, readiness_user,
             readiness_pass, readiness_db, _container_alive,
         )
-        if database_ready and _is_mysql_engine(engine):
+        if database_ready and _is_postgres_engine(engine):
+            _ensure_pg_iam_auth(container_id, engine, cluster_id)
+        elif database_ready and _is_mysql_engine(engine):
             _ensure_mysql_compatibility(
                 container_id,
                 ready_host,
@@ -7485,6 +8313,7 @@ def _start_db_cluster(p):
                 cluster["Status"] = "stopped"
                 for inst in _cluster_member_instances(cluster):
                     inst["DBInstanceStatus"] = "stopped"
+                _apply_deferred_global_writer_alias(cluster)
 
             start_failed = False
             pending_rotation = cluster.get("_pending_master_password_rotation")
@@ -7515,6 +8344,7 @@ def _start_db_cluster(p):
                         cluster_id, engine,
                     )
                 cluster["_shared_container_ready"] = True
+                _apply_deferred_global_writer_alias(cluster)
                 if _aurora_mysql_8_replication_enabled(cluster):
                     if compute_recreated:
                         # A new container has a new hostname, while the
@@ -7596,6 +8426,8 @@ def _stop_db_cluster(p):
     # Publish the transitional status before touching compute so concurrent
     # reader bootstrap workers can tell a stop-in-progress from a genuinely
     # dead container and park instead of destroying preserved compute.
+    if "_password_reset_describes" in cluster:
+        cluster["_password_reset_describes"] = 3  # settled; reassigned, not popped (see _password_reset_view)
     cluster["Status"] = "stopping"
     if not _stop_cluster_shared_container(
         cluster.get("DBClusterIdentifier", cluster_id), cluster,
@@ -7954,8 +8786,11 @@ def _describe_option_groups(p):
 
     members = "".join(
         f"<OptionGroup>{_option_group_xml(g)}</OptionGroup>" for g in groups)
+    members, marker_xml, page_error = _records_page(p, members, "OptionGroup")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeOptionGroupsResponse",
-        f"<DescribeOptionGroupsResult><OptionGroupsList>{members}</OptionGroupsList></DescribeOptionGroupsResult>")
+        f"<DescribeOptionGroupsResult><OptionGroupsList>{members}</OptionGroupsList>{marker_xml}</DescribeOptionGroupsResult>")
 
 
 def _describe_option_group_options(p):
@@ -8170,6 +9005,8 @@ def _create_global_cluster(p):
         _attach_cluster_to_global(gc, source_cluster, is_writer=True)
     _global_clusters[gc_id] = gc
     _tags[arn] = list(gc["TagList"])
+    if source_cluster:
+        _sync_global_writer_endpoint_aliases(gc)
     return _xml(200, "CreateGlobalClusterResponse",
         f"<CreateGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></CreateGlobalClusterResult>")
 
@@ -8197,11 +9034,14 @@ def _describe_global_clusters(p):
             snapshots.append(snapshot)
         gcs = snapshots
 
+    gcs, marker_xml, page_error = _offset_page(p, gcs)
+    if page_error:
+        return page_error
     members_xml = "".join(
         f"<GlobalClusterMember>{_global_cluster_xml(gc)}</GlobalClusterMember>" for gc in gcs
     )
     return _xml(200, "DescribeGlobalClustersResponse",
-        f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters></DescribeGlobalClustersResult>")
+        f"<DescribeGlobalClustersResult><GlobalClusters>{members_xml}</GlobalClusters>{marker_xml}</DescribeGlobalClustersResult>")
 
 
 def _delete_global_cluster(p):
@@ -8281,6 +9121,7 @@ def _remove_from_global_cluster(p):
         if cluster:
             cluster.pop("GlobalClusterIdentifier", None)
             cluster.pop("GlobalWriteForwardingStatus", None)
+            _move_global_writer_alias(_global_cluster_endpoint(gc), [(cluster, False)])
             if not member.get("IsWriter"):
                 _clear_mysql_replication_metadata(cluster)
                 if not cluster.get("DBClusterMembers"):
@@ -8348,7 +9189,11 @@ def _modify_global_cluster_impl(p):
         for member in gc.get("GlobalClusterMembers", []):
             member_cluster = _resolve_cluster(member["DBClusterArn"])
             if member_cluster:
-                member_cluster["EngineVersion"] = engine_version
+                _set_cluster_engine_version(member_cluster, engine_version)
+
+    if new_id and new_id != gc_id:
+        # The writer's container rejoins with the new global name in place of the old one.
+        _sync_global_writer_endpoint_aliases(gc)
 
     return _xml(200, "ModifyGlobalClusterResponse",
         f"<ModifyGlobalClusterResult><GlobalCluster>{_global_cluster_xml(gc)}</GlobalCluster></ModifyGlobalClusterResult>")
@@ -9323,6 +10168,7 @@ def _switchover_global_cluster(p):
     result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
+    _sync_global_writer_endpoint_aliases(_global_clusters.get(result["GlobalClusterIdentifier"]))
     return _xml(200, "SwitchoverGlobalClusterResponse",
         f"<SwitchoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></SwitchoverGlobalClusterResult>")
 
@@ -9350,6 +10196,7 @@ def _failover_global_cluster(p):
         result = _planned_mysql_global_writer_switch(p)
     if isinstance(result, tuple):
         return result
+    _sync_global_writer_endpoint_aliases(_global_clusters.get(result["GlobalClusterIdentifier"]))
     return _xml(200, "FailoverGlobalClusterResponse",
         f"<FailoverGlobalClusterResult><GlobalCluster>{_global_cluster_xml(result)}</GlobalCluster></FailoverGlobalClusterResult>")
 
@@ -9394,7 +10241,7 @@ def _global_endpoint_token():
 def _global_cluster_endpoint(gc):
     """<id>.global-<12 lowercase alphanumerics>.global.rds.amazonaws.com, present with no members (AWS capture)."""
     token = gc.setdefault("_EndpointToken", _global_endpoint_token())
-    return f"{gc['GlobalClusterIdentifier']}.global-{token}.global.rds.amazonaws.com"
+    return f"{gc['GlobalClusterIdentifier']}.global-{token}{_GLOBAL_ENDPOINT_SUFFIX}"
 
 
 def _global_cluster_xml(gc):
@@ -9499,8 +10346,11 @@ def _describe_engine_versions(p):
             <SupportsBabelfish>false</SupportsBabelfish>
             <SupportsCertificateRotationWithoutRestart>true</SupportsCertificateRotationWithoutRestart>
         </DBEngineVersion>"""
+    members, marker_xml, page_error = _records_page(p, members, "DBEngineVersion")
+    if page_error:
+        return page_error
     return _xml(200, "DescribeDBEngineVersionsResponse",
-        f"<DescribeDBEngineVersionsResult><DBEngineVersions>{members}</DBEngineVersions></DescribeDBEngineVersionsResult>")
+        f"<DescribeDBEngineVersionsResult><DBEngineVersions>{members}</DBEngineVersions>{marker_xml}</DescribeDBEngineVersionsResult>")
 
 
 def _describe_orderable_options(p):
@@ -9550,8 +10400,11 @@ def _describe_orderable_options(p):
             <SupportsClusters>false</SupportsClusters>
             <SupportedActivityStreamModes/>
         </OrderableDBInstanceOption>"""
+    members, marker_xml, page_error = _records_page(p, members, "OrderableDBInstanceOption", 1000)
+    if page_error:
+        return page_error
     return _xml(200, "DescribeOrderableDBInstanceOptionsResponse",
-        f"<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>{members}</OrderableDBInstanceOptions></DescribeOrderableDBInstanceOptionsResult>")
+        f"<DescribeOrderableDBInstanceOptionsResult><OrderableDBInstanceOptions>{members}</OrderableDBInstanceOptions>{marker_xml}</DescribeOrderableDBInstanceOptionsResult>")
 
 
 # ---------------------------------------------------------------------------
@@ -9686,8 +10539,8 @@ def _instance_xml(i):
         <PerformanceInsightsEnabled>{str(i.get('PerformanceInsightsEnabled',False)).lower()}</PerformanceInsightsEnabled>
         {_performance_insights_details_xml(i)}
         {_database_insights_mode_xml(i)}
-        <EnabledCloudwatchLogsExports/>
-        <ProcessorFeatures/>
+        {_logs_exports_xml(i, always=True)}
+        <ProcessorFeatures>{"".join(f"<ProcessorFeature><Name>{_esc(f['Name'])}</Name><Value>{_esc(f['Value'])}</Value></ProcessorFeature>" for f in i.get('ProcessorFeatures') or [])}</ProcessorFeatures>
         <DeletionProtection>{str(i.get('DeletionProtection',False)).lower()}</DeletionProtection>
         <AssociatedRoles/>
         {f"<MaxAllocatedStorage>{i['MaxAllocatedStorage']}</MaxAllocatedStorage>" if i.get('MaxAllocatedStorage') else ""}
@@ -9697,7 +10550,16 @@ def _instance_xml(i):
         <BackupTarget>{i.get('BackupTarget','region')}</BackupTarget>
         <NetworkType>{i.get('NetworkType','IPV4')}</NetworkType>
         <StorageThroughput>{i.get('StorageThroughput',0)}</StorageThroughput>
+        {f"<DedicatedLogVolume>{str(i['DedicatedLogVolume']).lower()}</DedicatedLogVolume>" if 'DedicatedLogVolume' in i else ""}
+        {f"<EngineLifecycleSupport>{i['EngineLifecycleSupport']}</EngineLifecycleSupport>" if i.get('EngineLifecycleSupport') else ""}
         <IsStorageConfigUpgradeAvailable>{str(i.get('IsStorageConfigUpgradeAvailable',False)).lower()}</IsStorageConfigUpgradeAvailable>"""
+
+
+def _logs_exports_xml(resource, always=False):
+    logs = resource.get("EnabledCloudwatchLogsExports") or []
+    if not logs and not always:
+        return ""
+    return f"<EnabledCloudwatchLogsExports>{''.join(f'<member>{_esc(t)}</member>' for t in logs)}</EnabledCloudwatchLogsExports>"
 
 
 def _serverlessv2_xml(c):
@@ -9763,6 +10625,13 @@ def _cluster_xml(c):
         f"<GlobalClusterIdentifier>{global_cluster_id}</GlobalClusterIdentifier>"
         if global_cluster_id else ""
     )
+    pending = c.get("PendingModifiedValues")
+    pending_xml = (
+        "<PendingModifiedValues>"
+        + "".join(f"<{k}>{v}</{k}>" for k, v in pending.items())
+        + "</PendingModifiedValues>"
+        if pending else ""
+    )
     global_write_forwarding = c.get("GlobalWriteForwardingStatus")
     global_write_forwarding_xml = (
         f"<GlobalWriteForwardingStatus>{global_write_forwarding}</GlobalWriteForwardingStatus>"
@@ -9791,6 +10660,7 @@ def _cluster_xml(c):
         <EngineMode>{c.get('EngineMode','provisioned')}</EngineMode>
         {_serverlessv2_xml(c)}
         <Status>{c['Status']}</Status>
+        {pending_xml}
         <MasterUsername>{c.get('MasterUsername','admin')}</MasterUsername>
         {db_name_xml}
         <Endpoint>{c.get('Endpoint','')}</Endpoint>
@@ -9825,6 +10695,14 @@ def _cluster_xml(c):
         <AllocatedStorage>{c.get('AllocatedStorage',1)}</AllocatedStorage>
         <ActivityStreamStatus>{c.get('ActivityStreamStatus','stopped')}</ActivityStreamStatus>
         <NetworkType>{c.get('NetworkType','IPV4')}</NetworkType>
+        {f"<StorageType>{c['StorageType']}</StorageType>" if c.get('StorageType') else ""}
+        {f"<Iops>{c['Iops']}</Iops>" if c.get('Iops') is not None else ""}
+        {f"<AutoMinorVersionUpgrade>{str(c['AutoMinorVersionUpgrade']).lower()}</AutoMinorVersionUpgrade>" if 'AutoMinorVersionUpgrade' in c else ""}
+        {f"<MonitoringInterval>{c['MonitoringInterval']}</MonitoringInterval>" if 'MonitoringInterval' in c else ""}
+        {f"<MonitoringRoleArn>{c['MonitoringRoleArn']}</MonitoringRoleArn>" if c.get('MonitoringRoleArn') else ""}
+        {f"<BacktrackWindow>{c['BacktrackWindow']}</BacktrackWindow>" if 'BacktrackWindow' in c else ""}
+        {f"<LocalWriteForwardingStatus>{c['LocalWriteForwardingStatus']}</LocalWriteForwardingStatus>" if c.get('LocalWriteForwardingStatus') else ""}
+        {_logs_exports_xml(c)}
         {global_cluster_xml}
         {global_write_forwarding_xml}
         {master_user_secret_xml}
@@ -9848,12 +10726,9 @@ def _snapshot_xml(s):
         <VpcId>{s.get('VpcId','vpc-00000000')}</VpcId>
         <Port>{s.get('Port',5432)}</Port>
         <MasterUsername>{s.get('MasterUsername','admin')}</MasterUsername>
-        <DBName>{s.get('DBName','')}</DBName>
         <SnapshotType>{s.get('SnapshotType','manual')}</SnapshotType>
         <LicenseModel>{s.get('LicenseModel','general-public-license')}</LicenseModel>
         <StorageType>{s.get('StorageType','gp2')}</StorageType>
-        <DBInstanceClass>{s.get('DBInstanceClass','db.t3.micro')}</DBInstanceClass>
-        <StorageEncrypted>{str(s.get('StorageEncrypted',False)).lower()}</StorageEncrypted>
         <KmsKeyId>{s.get('KmsKeyId','')}</KmsKeyId>
         <Encrypted>{str(s.get('Encrypted',False)).lower()}</Encrypted>
         <IAMDatabaseAuthenticationEnabled>{str(s.get('IAMDatabaseAuthenticationEnabled',False)).lower()}</IAMDatabaseAuthenticationEnabled>
@@ -10500,6 +11375,29 @@ def _db_proxy_page(params, records, key_fn, label):
 
 def _marker_xml(next_marker):
     return f"<Marker>{_esc(next_marker)}</Marker>" if next_marker else ""
+
+
+def _offset_page(params, items, maximum=100):
+    """Apply MaxRecords / Marker to a list. Returns ``(page, marker_xml, error)``."""
+    max_records, error = _db_proxy_int_error(params, "MaxRecords", _DB_PROXY_MIN_MAX_RECORDS, maximum)
+    if error:
+        return None, None, error
+    limit = max_records or _DB_PROXY_DEFAULT_MAX_RECORDS
+    try:
+        start = max(int(base64.urlsafe_b64decode(_p(params, "Marker").encode()).decode()), 0)
+    except (ValueError, UnicodeDecodeError):
+        start = 0
+    end = start + limit
+    marker = base64.urlsafe_b64encode(str(end).encode()).decode() if end < len(items) else None
+    return items[start:end], _marker_xml(marker), None
+
+
+def _records_page(params, members_xml, tag, maximum=100):
+    """`_offset_page` over rendered, non-nested ``<tag>`` members."""
+    close = f"</{tag}>"
+    members = [m + close for m in members_xml.split(close)[:-1]]
+    page, marker_xml, error = _offset_page(params, members, maximum)
+    return ("".join(page) if page is not None else None), marker_xml, error
 
 
 def _parse_user_auth_configs(params, prefix="Auth"):
