@@ -2,6 +2,7 @@ import asyncio
 import importlib
 import json
 import os
+import re
 import threading
 import time
 
@@ -1827,7 +1828,7 @@ def test_glue_reset_clears_every_store_across_regions():
 
     account = "123456789012"
     regional_stores = {key: store for key, store in gluemod._ALL_STATE.items() if key != "tags"}
-    assert len(regional_stores) == 16
+    assert len(regional_stores) == 17
 
     for index, store in enumerate(regional_stores.values()):
         store.set_scoped(account, "us-east-1", f"east-{index}", {"scope": "east"})
@@ -3023,3 +3024,644 @@ def test_glue_extract_python_error_finds_last_traceback():
     assert out.startswith("Traceback")
     assert "ValueError: real" in out and "OldError" not in out
     assert _extract_python_error("just INFO lines") == ""
+
+
+# ---- Table optimizers: shapes, defaults and messages from real-AWS captures (eu-west-2, us-east-1) ----
+
+_GLUE_SUFFIX = re.compile(r" \(Service: glue; Status Code: (\d+); Error Code: (\w+); Request ID: [0-9a-f-]{36}; Proxy: null\)$")
+
+
+def _optimizer_tables(glue, s3, sort_fields=()):
+    import uuid
+
+    db = f"opt{uuid.uuid4().hex[:8]}"
+    bucket = f"opt-wh-{uuid.uuid4().hex[:8]}"
+    s3.create_bucket(Bucket=bucket)
+    s3.put_object(Bucket=bucket, Key="t/metadata/00000.metadata.json", Body=json.dumps({
+        "format-version": 2, "default-sort-order-id": 1,
+        "sort-orders": [{"order-id": 1, "fields": list(sort_fields)}]}).encode())
+    glue.create_database(DatabaseInput={"Name": db})
+    glue.create_table(DatabaseName=db, TableInput={
+        "Name": "t", "TableType": "EXTERNAL_TABLE", "StorageDescriptor": {"Location": f"s3://{bucket}/t"},
+        "Parameters": {"table_type": "ICEBERG", "metadata_location": f"s3://{bucket}/t/metadata/00000.metadata.json"}})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "plain", "TableType": "EXTERNAL_TABLE",
+                                                   "StorageDescriptor": {"Location": f"s3://{bucket}/plain"}})
+    glue.create_table(DatabaseName=db, TableInput={"Name": "nolocation", "TableType": "EXTERNAL_TABLE"})
+    return db
+
+
+def _optimizer_role(db, bucket_of_t):
+    """A role with the access AWS requires of an optimizer role (Glue table access and its S3 location)."""
+    import uuid
+
+    from conftest import make_client
+
+    iam = make_client("iam")
+    name = f"opt-role-{uuid.uuid4().hex[:8]}"
+    arn = iam.create_role(RoleName=name, AssumeRolePolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": {"Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole"}]}))["Role"]["Arn"]
+    iam.put_role_policy(RoleName=name, PolicyName="p", PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": "*"},
+        {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket_of_t}"},
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+         "Resource": f"arn:aws:s3:::{bucket_of_t}/*"}]}))
+    return {"roleArn": arn, "enabled": False}
+
+
+def _optimizer_setup(glue, s3, **kwargs):
+    db = _optimizer_tables(glue, s3, **kwargs)
+    bucket = glue.get_table(DatabaseName=db, Name="t")["Table"]["StorageDescriptor"]["Location"].split("/")[2]
+    return db, _optimizer_role(db, bucket)
+
+
+def _optimizer_error(call):
+    """(code, message without Glue's suffix, status inside the suffix)."""
+    with pytest.raises(ClientError) as exc:
+        call()
+    err = exc.value.response["Error"]
+    assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+    match = _GLUE_SUFFIX.search(err["Message"])
+    assert match and match.group(2) == err["Code"], err["Message"]
+    return err["Code"], err["Message"][:match.start()], int(match.group(1))
+
+
+def test_glue_table_optimizer_lifecycle_and_defaults(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    assert "TableOptimizer" not in glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    got = glue.get_table_optimizer(**ids, Type="compaction")
+    assert {k: got[k] for k in ("CatalogId", "DatabaseName", "TableName")} == ids
+    assert got["TableOptimizer"] == {"type": "compaction", "configurationSource": "table", "configuration": {
+        **_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "binpack"}}}}
+
+    glue.create_table_optimizer(**ids, Type="orphan_file_deletion", TableOptimizerConfiguration=_ROLE)
+    assert glue.get_table_optimizer(**ids, Type="orphan_file_deletion")["TableOptimizer"]["configuration"][
+        "orphanFileDeletionConfiguration"] == {"icebergConfiguration": {"runRateInHours": 24}}
+
+    glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"numberOfSnapshotsToRetain": 3}}})
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"][
+        "retentionConfiguration"] == {"icebergConfiguration": {
+            "numberOfSnapshotsToRetain": 3, "cleanExpiredFiles": True, "runRateInHours": 24}}
+    # Update replaces the configuration (fields left out are dropped) and does not check the run rate.
+    glue.update_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}})
+    assert glue.get_table_optimizer(**ids, Type="retention")["TableOptimizer"]["configuration"] == {
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"cleanExpiredFiles": True, "runRateInHours": 1}}}
+
+    assert glue.list_table_optimizer_runs(**ids, Type="compaction")["TableOptimizerRuns"] == []
+    glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")
+    assert _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        "EntityNotFoundException", "No optimizer of type orphan_file_deletion found for the table: t", 404)
+
+
+def test_glue_table_optimizer_errors(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=_ROLE)) == (
+        "AlreadyExistsException", "An optimizer of type compaction already exists on table with name: t", 400)
+    assert _optimizer_error(lambda: glue.update_table_optimizer(
+        **ids, Type="retention", TableOptimizerConfiguration=_ROLE)) == (
+        "EntityNotFoundException", "No optimizer of type retention found for the table: t", 404)
+    assert _optimizer_error(lambda: glue.delete_table_optimizer(**ids, Type="orphan_file_deletion")) == (
+        "EntityNotFoundException", "An optimizer of type orphan_file_deletion does not exist on table t", 404)
+    assert _optimizer_error(lambda: glue.list_table_optimizer_runs(**ids, Type="retention")) == (
+        "EntityNotFoundException", "No optimizer of type retention found for the table: t", 404)
+    rate_message = "Request Validation Failed with error: Run rate for ICEBERG tables must be between 3 and 168 hours"
+    for rate in (1, 200):
+        assert _optimizer_error(lambda: glue.create_table_optimizer(**ids, Type="retention", TableOptimizerConfiguration={
+            **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": rate}}})) == (
+            "InvalidInputException", rate_message, 400)
+    # The run rate is refused before an existing optimizer; the table's location before the run rate.
+    assert _optimizer_error(lambda: glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}}))[1] == rate_message
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **{**ids, "TableName": "nolocation"}, Type="retention", TableOptimizerConfiguration={
+            **_ROLE, "retentionConfiguration": {"icebergConfiguration": {"runRateInHours": 1}}})) == (
+        "InvalidInputException", "Glue table storage warehouse location is null", 400)
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **{**ids, "TableName": "plain"}, Type="compaction", TableOptimizerConfiguration=_ROLE)) == (
+        "InvalidInputException", "Glue table metadata filepath is null", 400)
+    sort = {**_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}}
+    no_sort_order = ("InvalidInputException", "Sort order is not present in metadata", 400)
+    assert _optimizer_error(lambda: glue.update_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=sort)) == no_sort_order
+    glue.delete_table_optimizer(**ids, Type="compaction")
+    assert _optimizer_error(lambda: glue.create_table_optimizer(
+        **ids, Type="compaction", TableOptimizerConfiguration=sort)) == no_sort_order
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration=_ROLE)
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "binpack"}}
+
+    batch = glue.batch_get_table_optimizer(Entries=[
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "t", "type": "compaction"},
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "t", "type": "retention"},
+        {"catalogId": "000000000000", "databaseName": db, "tableName": "plain", "type": "compaction"}])
+    assert [o["tableOptimizer"]["type"] for o in batch["TableOptimizers"]] == ["compaction"]
+    assert [(f["tableName"], f["error"]) for f in batch["Failures"]] == [
+        ("t", {"ErrorCode": "EntityNotFoundException",
+               "ErrorMessage": "No optimizer of type retention found for the table: t"}),
+        ("plain", {"ErrorCode": "InvalidInputException",
+                   "ErrorMessage": "Request Validation Failed: Unsupported Table type"})]
+
+    glue.delete_table(DatabaseName=db, Name="t")
+    code, message, status = _optimizer_error(lambda: glue.get_table_optimizer(**ids, Type="compaction"))
+    assert (code, status) == ("EntityNotFoundException", 404)
+    assert re.fullmatch(r"Entity Not Found \(Service: AmazonDataCatalog; Status Code: 400; Error Code: "
+                        r"EntityNotFoundException; Request ID: [0-9a-f-]{36}; Proxy: null\)", message)
+
+
+def test_glue_table_optimizer_sort_strategy_with_a_sort_order(glue, s3):
+    db, _ROLE = _optimizer_setup(glue, s3, sort_fields=[{"source-id": 1, "transform": "identity",
+                                                         "direction": "asc", "null-order": "nulls-first"}])
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    glue.create_table_optimizer(**ids, Type="compaction", TableOptimizerConfiguration={
+        **_ROLE, "compactionConfiguration": {"icebergConfiguration": {"strategy": "sort"}}})
+    assert glue.get_table_optimizer(**ids, Type="compaction")["TableOptimizer"]["configuration"][
+        "compactionConfiguration"] == {"icebergConfiguration": {"strategy": "sort"}}
+
+
+@pytest.mark.auth_contract
+def test_glue_table_optimizer_role_needs_table_and_s3_access(auth_enabled, glue, s3):
+    """Under AUTH=true the optimizer role must read the table (else AWS's role refusal) and reach its S3
+    location (else "Access denied"), as captured on AWS; under AUTH=false any role is accepted."""
+    import uuid
+
+    from conftest import make_client
+
+    iam = make_client("iam")
+    db = _optimizer_tables(glue, s3)
+    ids = {"CatalogId": "000000000000", "DatabaseName": db, "TableName": "t"}
+    location = glue.get_table(DatabaseName=db, Name="t")["Table"]["StorageDescriptor"]["Location"]
+    bucket = location.split("/")[2]
+    trust = json.dumps({"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {
+        "Service": "glue.amazonaws.com"}, "Action": "sts:AssumeRole"}]})
+    table_arns = [f"arn:aws:glue:us-east-1:000000000000:table/{db}/t", f"arn:aws:glue:us-east-1:000000000000:database/{db}",
+                  "arn:aws:glue:us-east-1:000000000000:catalog"]
+    roles = {}
+    for name, statements in (
+            ("none", []),
+            ("glue", [{"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": table_arns}]),
+            ("full", [{"Effect": "Allow", "Action": ["glue:GetTable", "glue:UpdateTable"], "Resource": table_arns},
+                      {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": f"arn:aws:s3:::{bucket}"},
+                      {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+                       "Resource": f"arn:aws:s3:::{bucket}/*"}])):
+        role = f"opt-{name}-{uuid.uuid4().hex[:6]}"
+        roles[name] = iam.create_role(RoleName=role, AssumeRolePolicyDocument=trust)["Role"]["Arn"]
+        if statements:
+            iam.put_role_policy(RoleName=role, PolicyName="p",
+                                PolicyDocument=json.dumps({"Version": "2012-10-17", "Statement": statements}))
+
+    def create(name):
+        return glue.create_table_optimizer(**ids, Type="compaction",
+                                           TableOptimizerConfiguration={"roleArn": roles[name], "enabled": False})
+
+    if auth_enabled:
+        assert _optimizer_error(lambda: create("none")) == (
+            "AccessDeniedException", f"The provided IAM Role: {roles['none']} does not have the proper IAM "
+            "permissions to call Glue APIs. Please update the role's IAM permissions to allow access to the table", 403)
+        assert _optimizer_error(lambda: create("glue")) == ("AccessDeniedException", "Access denied", 403)
+    else:
+        create("none")
+        glue.delete_table_optimizer(**ids, Type="compaction")
+    create("full")
+
+
+# ---------------------------------------------------------------------------
+# BatchDeletePartition / GetPartitions filtering and paging
+# ---------------------------------------------------------------------------
+
+
+def _partitioned_table(glue, db, tbl, keys):
+    try:
+        glue.create_database(DatabaseInput={"Name": db})
+    except glue.exceptions.AlreadyExistsException:
+        pass
+    glue.create_table(
+        DatabaseName=db,
+        TableInput={
+            "Name": tbl,
+            "StorageDescriptor": {"Columns": [], "Location": f"s3://b/{tbl}"},
+            "PartitionKeys": [{"Name": k, "Type": t} for k, t in keys],
+        },
+    )
+
+
+def _add_partitions(glue, db, tbl, value_lists):
+    for i in range(0, len(value_lists), 100):
+        resp = glue.batch_create_partition(
+            DatabaseName=db,
+            TableName=tbl,
+            PartitionInputList=[{"Values": v} for v in value_lists[i:i + 100]],
+        )
+        assert resp["Errors"] == []
+
+
+def test_glue_batch_delete_partition(glue):
+    db, tbl = "qa-bdp-db", "qa-bdp-tbl"
+    _partitioned_table(glue, db, tbl, [("dt", "string")])
+    _add_partitions(glue, db, tbl, [["a"], ["b"], ["c"]])
+    glue.update_column_statistics_for_partition(
+        DatabaseName=db,
+        TableName=tbl,
+        PartitionValues=["a"],
+        ColumnStatisticsList=[{
+            "ColumnName": "x",
+            "ColumnType": "bigint",
+            "AnalyzedTime": time.time(),
+            "StatisticsData": {"Type": "LONG", "LongColumnStatisticsData": {"NumberOfNulls": 0, "NumberOfDistinctValues": 1}},
+        }],
+    )
+
+    resp = glue.batch_delete_partition(
+        DatabaseName=db, TableName=tbl, PartitionsToDelete=[{"Values": ["a"]}, {"Values": ["b"]}, {"Values": ["zz"]}]
+    )
+    assert resp["Errors"] == [{
+        "PartitionValues": ["zz"],
+        "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Partition not found"},
+    }]
+    remaining = glue.get_partitions(DatabaseName=db, TableName=tbl)["Partitions"]
+    assert [p["Values"] for p in remaining] == [["c"]]
+    # recreated partition must not inherit the deleted one's column statistics
+    _add_partitions(glue, db, tbl, [["a"]])
+    stats = glue.get_column_statistics_for_partition(
+        DatabaseName=db, TableName=tbl, PartitionValues=["a"], ColumnNames=["x"]
+    )
+    assert stats["ColumnStatisticsList"] == []
+
+    # the second copy of a duplicated entry is reported as not found
+    resp = glue.batch_delete_partition(
+        DatabaseName=db, TableName=tbl, PartitionsToDelete=[{"Values": ["c"]}, {"Values": ["c"]}]
+    )
+    assert [e["PartitionValues"] for e in resp["Errors"]] == [["c"]]
+
+    with pytest.raises(ClientError) as exc:
+        glue.batch_delete_partition(
+            DatabaseName=db, TableName=tbl, PartitionsToDelete=[{"Values": [str(i)]} for i in range(26)]
+        )
+    assert exc.value.response["Error"]["Code"] == "ValidationException"
+    assert exc.value.response["Error"]["Message"].startswith(
+        "1 validation error detected: Value '[PartitionValueList(values=[0]), PartitionValueList(values=[1]), "
+    )
+    assert exc.value.response["Error"]["Message"].endswith(
+        "PartitionValueList(values=[25])]' at 'partitionsToDelete' failed to satisfy constraint: "
+        "Member must have length less than or equal to 25"
+    )
+
+    with pytest.raises(ClientError) as exc:
+        glue.batch_delete_partition(DatabaseName=db, TableName="no-such-tbl", PartitionsToDelete=[{"Values": ["c"]}])
+    assert exc.value.response["Error"]["Code"] == "EntityNotFoundException"
+    assert exc.value.response["Error"]["Message"] == "Table no-such-tbl not found."
+    with pytest.raises(ClientError) as exc:
+        glue.batch_delete_partition(DatabaseName="no-such-db", TableName=tbl, PartitionsToDelete=[{"Values": ["c"]}])
+    assert exc.value.response["Error"]["Message"] == "Database no-such-db not found."
+
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_expression(glue):
+    db, tbl = "qa-gpe-db", "qa-gpe-tbl"
+    _partitioned_table(glue, db, tbl, [("tenant", "string"), ("region", "string"), ("dt", "string"),
+                                       ("kind", "string"), ("shard", "string")])
+    rows = [
+        ["t1", "us", "2024-01-01", "users", "0"],
+        ["t1", "us", "2024-01-02", "groups", "1"],
+        ["t1", "eu", "2024-01-03", "users", "2"],
+        ["t2", "us", "2024-02-01", "users", "0"],
+        ["t2", "eu", "2024-02-15", "roles", "1"],
+        ["t3", "ap", "2024-03-01", "users", "2"],
+    ]
+    _add_partitions(glue, db, tbl, rows)
+
+    def matching(expr):
+        parts = glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)["Partitions"]
+        return sorted(rows.index(p["Values"]) for p in parts)
+
+    assert matching("tenant = 't1'") == [0, 1, 2]
+    assert matching("tenant <> 't1'") == [3, 4, 5]
+    assert matching("tenant != 't1'") == [3, 4, 5]
+    assert matching("dt < '2024-01-03'") == [0, 1]
+    assert matching("dt <= '2024-01-03'") == [0, 1, 2]
+    assert matching("dt > '2024-02-01'") == [4, 5]
+    assert matching("dt >= '2024-02-01'") == [3, 4, 5]
+    assert matching("kind IN ('roles', 'groups')") == [1, 4]
+    assert matching("dt BETWEEN '2024-01-02' AND '2024-02-01'") == [1, 2, 3]
+    assert matching("dt LIKE '2024-01-%'") == [0, 1, 2]
+    assert matching("dt LIKE '2024-0_-01'") == [0, 3, 5]
+    assert matching("region = 'us' OR region = 'ap'") == [0, 1, 3, 5]
+    assert matching("NOT tenant = 't1'") == [3, 4, 5]
+    assert matching("NOT (tenant = 't1')") == [3, 4, 5]
+    assert matching("kind NOT IN ('users')") == [1, 4]
+    assert matching("dt NOT BETWEEN '2024-01-02' AND '2024-02-01'") == [0, 4, 5]
+    assert matching("(tenant = 't1' OR tenant = 't2') AND (region = 'eu')") == [2, 4]
+    assert matching("tenant = 't1' AND region = 'us' AND dt = '2024-01-02' AND kind = 'groups' AND shard = '1'") == [1]
+    assert matching("shard = 2") == [2, 5]
+    assert matching("shard > 1") == [2, 5]
+    assert matching("tenant = 't1' and region = 'us'") == [0, 1]
+    assert matching("TENANT = 't1'") == [0, 1, 2]
+    assert matching("`tenant` = 't1'") == [0, 1, 2]
+    assert matching("tenant = 't''1'") == []
+    assert matching("tenant IS NULL") == []
+    assert matching("tenant IS NOT NULL") == [0, 1, 2, 3, 4, 5]
+    assert matching("tenant = 't1' tenant") == [0, 1, 2]
+    # shapes Trino's GlueExpressionUtil.buildGlueExpression emits
+    assert matching("((tenant in ('t1', 't3'))) AND ((dt >= '2024-01-02' AND dt < '2024-03-01'))") == [1, 2]
+    assert matching("((region = 'us') OR (region = '__HIVE_DEFAULT_PARTITION__'))") == [0, 1, 3]
+    assert matching("(kind <> '__HIVE_DEFAULT_PARTITION__')") == [0, 1, 2, 3, 4, 5]
+
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_expression_numeric_keys(glue):
+    db, tbl = "qa-gpn-db", "qa-gpn-tbl"
+    _partitioned_table(glue, db, tbl, [("year", "int"), ("id", "bigint")])
+    _add_partitions(glue, db, tbl, [["9", "100"], ["10", "20"], ["2024", "3"]])
+
+    def years(expr):
+        parts = glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)["Partitions"]
+        return sorted(int(p["Values"][0]) for p in parts)
+
+    # numeric comparison, not lexical ("9" > "10" as strings)
+    assert years("year > 9") == [10, 2024]
+    assert years("id < 50") == [10, 2024]
+    assert years("((year >= 10 AND year <= 2024))") == [10, 2024]
+    assert years("(year in (9, 2024))") == [9, 2024]
+    assert years("year > '9'") == [10, 2024]
+    assert years("year BETWEEN 9 AND 10") == [9, 10]
+    for expr, shown in [("year = 'abc'", "abc"), ("year = 9.5", "9.5"),
+                        ("year <> '__HIVE_DEFAULT_PARTITION__'", "__HIVE_D")]:
+        with pytest.raises(ClientError) as exc:
+            glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)
+        assert exc.value.response["Error"] == {
+            "Code": "InvalidInputException",
+            "Message": "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
+                       f'For input string: "{shown}" is not an integer.',
+        }
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName=tbl, Expression="year LIKE '20%'")
+    assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
+
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_bad_expression(glue):
+    db, tbl = "qa-gpb-db", "qa-gpb-tbl"
+    _partitioned_table(glue, db, tbl, [("tenant", "string")])
+    for expr in ["tenant = ", "tenant = 't1' AND", "(tenant = 't1'", "nosuchcol = 'x'", "tenant === 't1'",
+                 "tenant IN ()", "garbage", "tenant", "'t1' = tenant", "\"tenant\" = 't1'", "tenant = \"t1\"",
+                 "tenant NOT LIKE 't%'"]:
+        with pytest.raises(ClientError) as exc:
+            glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)
+        assert exc.value.response["Error"] == {
+            "Code": "InvalidInputException", "Message": "Invalid partition expression!"
+        }, expr
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName="no-such-tbl", Expression="tenant = 't1'")
+    assert exc.value.response["Error"] == {"Code": "EntityNotFoundException", "Message": "Table no-such-tbl not found."}
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_paging_and_segments(glue):
+    db, tbl = "qa-gpp-db", "qa-gpp-tbl"
+    _partitioned_table(glue, db, tbl, [("n", "string")])
+    _add_partitions(glue, db, tbl, [[f"{i:03d}"] for i in range(250)])
+
+    pages, token = [], None
+    while True:
+        kwargs = {"NextToken": token} if token else {}
+        resp = glue.get_partitions(DatabaseName=db, TableName=tbl, MaxResults=100, **kwargs)
+        pages.append([p["Values"][0] for p in resp["Partitions"]])
+        token = resp.get("NextToken")
+        if not token:
+            break
+    # a NextToken comes back with every non-empty page, so the last page is empty
+    assert [len(p) for p in pages] == [100, 100, 50, 0]
+    assert sorted(v for p in pages for v in p) == [f"{i:03d}" for i in range(250)]
+
+    paginator = glue.get_paginator("get_partitions")
+    segments = [
+        [p["Values"][0] for page in paginator.paginate(
+            DatabaseName=db, TableName=tbl, Segment={"SegmentNumber": s, "TotalSegments": 3},
+            PaginationConfig={"PageSize": 40},
+        ) for p in page["Partitions"]]
+        for s in range(3)
+    ]
+    assert sorted(v for s in segments for v in s) == [f"{i:03d}" for i in range(250)]
+    assert all(segments)
+
+    def error(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            glue.get_partitions(DatabaseName=db, TableName=tbl, **kwargs)
+        return exc.value.response["Error"]["Code"], exc.value.response["Error"]["Message"]
+
+    assert error(Segment={"SegmentNumber": 3, "TotalSegments": 3}) == (
+        "InvalidInputException", "Segment number should be less than total segments.")
+    assert error(Segment={"SegmentNumber": 0, "TotalSegments": 11}) == (
+        "ValidationException", "1 validation error detected: Value '11' at 'segment.totalSegments' failed to "
+        "satisfy constraint: Member must have value less than or equal to 10")
+    assert error(MaxResults=2000) == (
+        "ValidationException", "1 validation error detected: Value '2000' at 'maxResults' failed to satisfy "
+        "constraint: Member must have value less than or equal to 1000")
+    assert error(NextToken="garbage") == ("InvalidInputException", "Invalid token value")
+
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_expression_parsing_quirks(glue):
+    db, tbl = "qa-gpq-db", "qa-gpq-tbl"
+    _partitioned_table(glue, db, tbl, [("tenant", "string"), ("shard", "string")])
+    rows = [["t1", "0"], ["T1", "1"], ["t2", "2"], ["a.b", "10"], ["a%b", "9"], ["t1x", "20"], ["a\\b", "10.0"]]
+    _add_partitions(glue, db, tbl, rows)
+
+    def matching(expr):
+        parts = glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)["Partitions"]
+        return sorted(rows.index(p["Values"]) for p in parts)
+
+    assert matching("") == list(range(len(rows)))
+    assert matching("tenant = 'T1'") == [1]
+    # LIKE ignores case, = does not
+    assert matching("tenant LIKE 't%'") == [0, 1, 2, 5]
+    assert matching("tenant LIKE 'a.b'") == [3]
+    assert matching("tenant LIKE 'a_b'") == [3, 4, 6]
+    # backslash is not an escape character
+    assert matching("tenant LIKE 'a\\%b'") == [6]
+    assert matching("tenant = 'a\\b'") == [6]
+    # numbers compared with a string key compare as text
+    assert matching("shard < 10") == [0, 1]
+    assert matching("shard BETWEEN 1 AND 9") == [1, 2, 3, 4, 5, 6]
+    assert matching("shard = +1") == [1]
+    assert matching("shard = 10.0") == [6]
+    assert matching("shard = 1e1") == []
+    assert matching("tenant = -1") == []
+    # redundant parentheses around a column or value
+    assert matching("(tenant) = 't1'") == [0]
+    assert matching("((tenant)) = (('t1'))") == [0]
+    assert matching("(((tenant = 't1')))") == [0]
+    # anything after a complete expression is ignored
+    for tail in [" )", " 'x'", " = 'x'", ";", " foo bar", " ORDER BY tenant", " LIMIT 1", " && shard = '0'", " xor 1"]:
+        assert matching("tenant = 't1'" + tail) == [0], tail
+    assert matching("tenant LIKE 'a%b' ESCAPE '\\'") == [3, 4, 6]
+    for expr in [" ", "NOT NOT tenant = 't1'", "tenant = 't1' || shard = '0'", "tenant = 'x' || 'y'",
+                 "shard = 1 + 0", "tenant <=> 't1'", "tenant == 't1'", "TRUE", "1 = 1", "tenant = shard",
+                 "tenant IN ('t1',)", "tenant = NULL", "tenant IS NOT 't1'", "tenant = 't1' AND tenant",
+                 "tenant = 't1' OR", "shard = 99999999999999999999"]:
+        with pytest.raises(ClientError) as exc:
+            glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)
+        assert exc.value.response["Error"] == {
+            "Code": "InvalidInputException", "Message": "Invalid partition expression!"
+        }, expr
+
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_expression_key_types(glue):
+    db = "qa-gpt-db"
+    prefix = "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
+    cases = {
+        "int": (["9", "10", "2024"], {
+            "k > 9": ["10", "2024"], "k = 300": [], "k = '+10'": ["10"], "k = +10": ["10"],
+            "k = 'abc'": prefix + 'For input string: "abc" is not an integer.',
+            "k = 9.5": prefix + 'For input string: "9.5" is not an integer.',
+            "k = 1e1": prefix + 'For input string: "1e1" is not an integer.',
+            "k LIKE '1%'": "Invalid partition expression!",
+        }),
+        "tinyint": (["1", "100"], {
+            "k > 9": ["100"],
+            "k = 'abcdefghijk'": prefix + 'For input string: "ab" is not an integer.',
+        }),
+        "bigint": (["1", "100"], {
+            "k = 99999999999999999999": "Invalid partition expression!",
+            "k <> '__HIVE_DEFAULT_PARTITION__'": prefix + 'For input string: "__HIVE_D" is not an integer.',
+        }),
+        "decimal(10,2)": (["1.50", "10.00"], {
+            "k > 2": ["10.00"], "k = 1.5": ["1.50"], "k = '1.5'": ["1.50"],
+            "k = 'abc'": prefix + "abc is not a decimal.",
+        }),
+        "date": (["2024-01-02", "2024-02-01"], {
+            "k > '2024-01-15'": ["2024-02-01"], "k = '2024-1-2'": ["2024-01-02"],
+            "k = 'abc'": prefix + "abc is not a date.", "k > 5": prefix + "5 is not a date.",
+            "k LIKE '2024%'": "Invalid partition expression!",
+        }),
+        "timestamp": (["2024-01-02 03:04:05", "2024-02-01 00:00:00"], {
+            "k > '2024-01-15 00:00:00'": ["2024-02-01 00:00:00"],
+            "k > '2024-01-15'": prefix + "Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] "
+                                         "2024-01-15 is not a timestamp.",
+        }),
+        "varchar(10)": (["ab", "cd"], {"k > 'b'": ["cd"], "k LIKE 'A%'": ["ab"]}),
+        # an unsupported key type makes every expression on the table invalid
+        "double": (["2.5", "10"], {"k > 3": "Invalid partition expression!"}),
+        "boolean": (["true", "false"], {"k = 'true'": "Invalid partition expression!"}),
+    }
+    for i, (key_type, (values, expectations)) in enumerate(cases.items()):
+        tbl = f"t{i}"
+        _partitioned_table(glue, db, tbl, [("k", key_type)])
+        _add_partitions(glue, db, tbl, [[v] for v in values])
+        for expr, expected in expectations.items():
+            if isinstance(expected, list):
+                parts = glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)["Partitions"]
+                assert sorted(p["Values"][0] for p in parts) == expected, (key_type, expr)
+            else:
+                with pytest.raises(ClientError) as exc:
+                    glue.get_partitions(DatabaseName=db, TableName=tbl, Expression=expr)
+                assert exc.value.response["Error"] == {"Code": "InvalidInputException", "Message": expected}, (
+                    key_type, expr)
+        glue.delete_table(DatabaseName=db, Name=tbl)
+
+    _partitioned_table(glue, db, "mixed", [("a", "string"), ("b", "boolean")])
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName="mixed", Expression="a = 'x'")
+    assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
+    glue.delete_table(DatabaseName=db, Name="mixed")
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_scan_window_and_tokens(glue):
+    db, tbl, other = "qa-gpw-db", "qa-gpw-tbl", "qa-gpw-other"
+    _partitioned_table(glue, db, tbl, [("n", "string")])
+    _partitioned_table(glue, db, other, [("n", "string")])
+    _add_partitions(glue, db, tbl, [[f"{i:03d}"] for i in range(600)])
+
+    def page_sizes(**kwargs):
+        sizes, token = [], None
+        while True:
+            resp = glue.get_partitions(DatabaseName=db, TableName=tbl, **kwargs, **({"NextToken": token} if token else {}))
+            sizes.append(len(resp["Partitions"]))
+            token = resp.get("NextToken")
+            if not token:
+                return sizes
+
+    # MaxResults bounds the partitions scanned, not the matches; 500 is the default
+    assert page_sizes() == [500, 100, 0]
+    assert page_sizes(Expression="n < '125'", MaxResults=100) == [100, 25, 0, 0, 0, 0, 0]
+    assert page_sizes(Expression="n = '250'", MaxResults=200) == [0, 1, 0, 0]
+
+    # segments are contiguous slices of the full order
+    full = [p["Values"][0] for p in glue.get_partitions(DatabaseName=db, TableName=tbl, MaxResults=1000)["Partitions"]]
+    segments = []
+    for s in range(3):
+        resp = glue.get_partitions(DatabaseName=db, TableName=tbl, Segment={"SegmentNumber": s, "TotalSegments": 3},
+                                   MaxResults=1000)
+        segments += [p["Values"][0] for p in resp["Partitions"]]
+    assert segments == full
+
+    token = glue.get_partitions(DatabaseName=db, TableName=tbl, MaxResults=100)["NextToken"]
+    assert len(glue.get_partitions(DatabaseName=db, TableName=tbl, MaxResults=7, NextToken=token)["Partitions"]) == 7
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName=other, NextToken=token)
+    assert exc.value.response["Error"] == {"Code": "InvalidInputException", "Message": "NextToken key is not valid"}
+
+    # error precedence: segment, then database/table, then expression, then token
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName="nope", Segment={"SegmentNumber": 5, "TotalSegments": 3})
+    assert exc.value.response["Error"]["Message"] == "Segment number should be less than total segments."
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName="qa-gpw-nope", TableName=tbl, Expression="garbage")
+    assert exc.value.response["Error"] == {"Code": "EntityNotFoundException", "Message": "Database qa-gpw-nope not found."}
+    with pytest.raises(ClientError) as exc:
+        glue.get_partitions(DatabaseName=db, TableName=tbl, Expression="garbage", NextToken="x")
+    assert exc.value.response["Error"]["Message"] == "Invalid partition expression!"
+
+    for name in (tbl, other):
+        glue.delete_table(DatabaseName=db, Name=name)
+    glue.delete_database(Name=db)
+
+
+def test_glue_get_partitions_exclude_column_schema(glue):
+    db, tbl = "qa-gpx-db", "qa-gpx-tbl"
+    _partitioned_table(glue, db, tbl, [("n", "string")])
+    glue.create_partition(DatabaseName=db, TableName=tbl, PartitionInput={
+        "Values": ["a"], "StorageDescriptor": {"Columns": [{"Name": "c", "Type": "string"}], "Location": "s3://b/a"}})
+    full = glue.get_partitions(DatabaseName=db, TableName=tbl)["Partitions"][0]
+    assert full["StorageDescriptor"]["Columns"] == [{"Name": "c", "Type": "string"}]
+    lean = glue.get_partitions(DatabaseName=db, TableName=tbl, ExcludeColumnSchema=True)["Partitions"][0]
+    assert lean["StorageDescriptor"] == {**full["StorageDescriptor"], "Columns": []}
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)
+
+
+def test_glue_delete_partition_errors(glue):
+    db, tbl = "qa-dpe-db", "qa-dpe-tbl"
+    _partitioned_table(glue, db, tbl, [("n", "string")])
+    _add_partitions(glue, db, tbl, [["a"]])
+
+    def error(**kwargs):
+        with pytest.raises(ClientError) as exc:
+            glue.delete_partition(**{"DatabaseName": db, "TableName": tbl, "PartitionValues": ["a"], **kwargs})
+        return exc.value.response["Error"]
+
+    assert error(PartitionValues=["zz"]) == {"Code": "EntityNotFoundException", "Message": "Partition not found"}
+    assert error(TableName="nope") == {"Code": "EntityNotFoundException", "Message": "Table nope not found."}
+    assert error(DatabaseName="qa-dpe-nope") == {
+        "Code": "EntityNotFoundException", "Message": "Database qa-dpe-nope not found."}
+    glue.delete_partition(DatabaseName=db, TableName=tbl, PartitionValues=["a"])
+    assert error() == {"Code": "EntityNotFoundException", "Message": "Partition not found"}
+    glue.delete_table(DatabaseName=db, Name=tbl)
+    glue.delete_database(Name=db)

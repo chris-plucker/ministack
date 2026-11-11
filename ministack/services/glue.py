@@ -13,8 +13,10 @@ scripts or when Docker is unavailable.
 Crawlers transition through RUNNING state with a configurable timer.
 """
 
+import base64
 import contextvars
 import copy
+import datetime
 import fnmatch
 import json
 import logging
@@ -24,6 +26,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from decimal import Decimal
 from urllib.parse import unquote
 
 from ministack.core import container_reaper
@@ -35,8 +38,11 @@ from ministack.core.responses import (
     error_response_json,
     get_account_id,
     get_region,
-    json_response,
     new_uuid,
+    to_output_shape,
+)
+from ministack.core.responses import (
+    json_response as _core_json_response,
 )
 
 logger = logging.getLogger("glue")
@@ -62,6 +68,22 @@ GLUE_DOCKER_IMAGE_OVERRIDE = os.environ.get("GLUE_DOCKER_IMAGE", "")
 
 _docker = None
 _ministack_network = None
+
+
+_DOCUMENT_MEMBERS = frozenset(('Type', 'InitialDefault', 'WriteDefault', 'Records'))
+
+
+def _drop_none(value):
+    """AWS omits unset members; it never sends null. Document members pass through as given."""
+    if isinstance(value, dict):
+        return {k: v if k in _DOCUMENT_MEMBERS else _drop_none(v) for k, v in value.items() if v is not None}
+    if isinstance(value, list):
+        return [_drop_none(v) for v in value]
+    return value
+
+
+def json_response(data, status=200, **kwargs):
+    return _core_json_response(_drop_none(data), status, **kwargs)
 
 
 def _get_docker():
@@ -126,6 +148,7 @@ _workflow_runs = AccountRegionScopedDict()  # workflow_name -> [run, ...]
 _user_defined_functions = AccountRegionScopedDict()  # "db_name/function_name" -> udf dict
 _table_column_statistics = AccountRegionScopedDict()  # "db/table" -> {column_name: stats}
 _partition_column_statistics = AccountRegionScopedDict()  # "db/table" -> [{"Values": [...], "Stats": {col: stats}}]
+_table_optimizers = AccountRegionScopedDict()  # "db/table" -> {optimizer type: TableOptimizer}
 
 _ALL_STATE = {
     "databases": _databases,
@@ -144,6 +167,7 @@ _ALL_STATE = {
     "workflow_runs": _workflow_runs,
     "user_defined_functions": _user_defined_functions,
     "table_column_statistics": _table_column_statistics,
+    "table_optimizers": _table_optimizers,
     "partition_column_statistics": _partition_column_statistics,
 }
 
@@ -293,12 +317,20 @@ def _handle_request_sync(method, path, headers, body, query_params):
         "GetTables": _get_tables,
         "UpdateTable": _update_table,
         "BatchDeleteTable": _batch_delete_table,
+        # Table optimizers
+        "CreateTableOptimizer": _create_table_optimizer,
+        "GetTableOptimizer": _get_table_optimizer,
+        "UpdateTableOptimizer": _update_table_optimizer,
+        "DeleteTableOptimizer": _delete_table_optimizer,
+        "BatchGetTableOptimizer": _batch_get_table_optimizer,
+        "ListTableOptimizerRuns": _list_table_optimizer_runs,
         # Partitions
         "CreatePartition": _create_partition,
         "DeletePartition": _delete_partition,
         "GetPartition": _get_partition,
         "GetPartitions": _get_partitions,
         "BatchCreatePartition": _batch_create_partition,
+        "BatchDeletePartition": _batch_delete_partition,
         "BatchGetPartition": _batch_get_partition,
         "BatchUpdatePartition": _batch_update_partition,
         # Partition Indexes
@@ -893,6 +925,9 @@ def _create_database(data):
         "CreateTime": int(time.time()),
         "CatalogId": get_account_id(),
     }
+    for k in ("CreateTableDefaultPermissions", "TargetDatabase", "FederatedDatabase"):
+        if db_input.get(k) is not None:
+            _databases[name][k] = db_input[k]
     if data.get("Tags"):
         _tags[_arn("database", name)] = dict(data["Tags"])
     return json_response({})
@@ -911,6 +946,7 @@ def _delete_database(data):
         _partition_indexes.pop(k, None)
         _table_column_statistics.pop(k, None)
         _partition_column_statistics.pop(k, None)
+        _table_optimizers.pop(k, None)
     return json_response({})
 
 
@@ -931,7 +967,8 @@ def _update_database(data):
     db_input = data.get("DatabaseInput", {})
     if name not in _databases:
         return error_response_json("EntityNotFoundException", f"Database {name} not found", 400)
-    safe_keys = {"Description", "LocationUri", "Parameters"}
+    safe_keys = {"Description", "LocationUri", "Parameters", "CreateTableDefaultPermissions", "TargetDatabase",
+                 "FederatedDatabase"}
     for k in safe_keys:
         if k in db_input:
             _databases[name][k] = db_input[k]
@@ -957,7 +994,7 @@ def _create_table(data):
         "Owner": table_input.get("Owner", ""),
         "CreateTime": int(time.time()),
         "UpdateTime": int(time.time()),
-        "LastAccessTime": int(time.time()),
+        "LastAccessTime": table_input.get("LastAccessTime", int(time.time())),
         "StorageDescriptor": table_input.get("StorageDescriptor", {}),
         "PartitionKeys": table_input.get("PartitionKeys", []),
         "TableType": table_input.get("TableType", "EXTERNAL_TABLE"),
@@ -973,6 +1010,9 @@ def _create_table(data):
         # botocore Table output shape.
         "VersionId": "1",
     }
+    for k in ("LastAnalyzedTime", "Retention", "TargetTable", "FederatedTable"):
+        if table_input.get(k) is not None:
+            _tables[key][k] = table_input[k]
     return json_response({})
 
 
@@ -987,6 +1027,7 @@ def _delete_table(data):
     _partition_indexes.pop(key, None)
     _table_column_statistics.pop(key, None)
     _partition_column_statistics.pop(key, None)
+    _table_optimizers.pop(key, None)
     return json_response({})
 
 
@@ -1038,6 +1079,11 @@ def _update_table(data):
         "ViewExpandedText",
         "ViewDefinition",
         "IsMultiDialectView",
+        "LastAccessTime",
+        "LastAnalyzedTime",
+        "Retention",
+        "TargetTable",
+        "FederatedTable",
     }
     for k in safe_keys:
         if k in table_input:
@@ -1069,7 +1115,206 @@ def _batch_delete_table(data):
             _partition_indexes.pop(key, None)
             _table_column_statistics.pop(key, None)
             _partition_column_statistics.pop(key, None)
+            _table_optimizers.pop(key, None)
     return json_response({"Errors": errors})
+
+
+# ---- Table optimizers (control plane only: optimizers never run) ----
+# Shapes, defaults and messages from a real-AWS capture (eu-west-2, 2026-11-01).
+
+
+def _optimizer_config(optimizer_type, config):
+    """The stored configuration: what the call sent, with the defaults AWS fills in for its type."""
+    config = copy.deepcopy(config or {})
+    if optimizer_type == "compaction":
+        block = config.setdefault("compactionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("strategy", "binpack")
+    elif optimizer_type == "retention":
+        block = config.setdefault("retentionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("cleanExpiredFiles", True)
+        block.setdefault("runRateInHours", 24)
+    elif optimizer_type == "orphan_file_deletion":
+        block = config.setdefault("orphanFileDeletionConfiguration", {}).setdefault("icebergConfiguration", {})
+        block.setdefault("runRateInHours", 24)
+    return config
+
+
+def _optimizer_table(data):
+    """(key, table, optimizers) for the call's table, or an error response when the table doesn't exist."""
+    key = f"{data.get('DatabaseName')}/{data.get('TableName')}"
+    table = _tables.get(key)
+    if table is None:
+        return None, _optimizer_error("EntityNotFoundException", _entity_not_found_message(), 404)
+    return (key, table, _table_optimizers.get(key) or {}), None
+
+
+def _optimizer_error(code, message, glue_status):
+    """AWS ends every table optimizer error with Glue's service suffix (real AWS capture)."""
+    return error_response_json(code, f"{message} (Service: glue; Status Code: {glue_status}; Error Code: {code}; "
+                                     f"Request ID: {new_uuid()}; Proxy: null)", 400)
+
+
+def _entity_not_found_message():
+    return (f"Entity Not Found (Service: AmazonDataCatalog; Status Code: 400; Error Code: EntityNotFoundException; "
+            f"Request ID: {new_uuid()}; Proxy: null)")
+
+
+def _run_rate_error(config):
+    """Retention and orphan file deletion run every 3 to 168 hours."""
+    for block in ("retentionConfiguration", "orphanFileDeletionConfiguration"):
+        rate = (((config or {}).get(block) or {}).get("icebergConfiguration") or {}).get("runRateInHours")
+        if rate is not None and not 3 <= rate <= 168:
+            return _optimizer_error("InvalidInputException", "Request Validation Failed with error: "
+                                    "Run rate for ICEBERG tables must be between 3 and 168 hours", 400)
+    return None
+
+
+def _optimizer_response(optimizer_type, config):
+    return {"type": optimizer_type, "configuration": config, "configurationSource": "table"}
+
+
+def _no_optimizer(optimizer_type, table_name):
+    return _optimizer_error("EntityNotFoundException",
+                            f"No optimizer of type {optimizer_type} found for the table: {table_name}", 404)
+
+
+def _role_refusal(table, role_arn):
+    """Under AUTH=true, the optimizer role must be able to read the table and reach its S3 location."""
+    from ministack.app import AUTH
+    if not AUTH:
+        return None
+    from ministack.core.iam_evaluator import EvalContext, _gather_role_policies, evaluate
+
+    account = role_arn.split(":")[4] if role_arn.count(":") >= 5 else get_account_id()
+    policies = _gather_role_policies(role_arn.rsplit("/", 1)[-1], account)
+
+    def allowed(action, resource):
+        ctx = EvalContext(principal_arn=role_arn, principal_type="AssumedRole", principal_account=account,
+                          action=action, resource_arn=resource, region=get_region())
+        return evaluate(ctx, policies).decision == "Allow"
+
+    table_arn = f"arn:aws:glue:{get_region()}:{get_account_id()}:table/{table['DatabaseName']}/{table['Name']}"
+    if not allowed("glue:GetTable", table_arn):
+        return _optimizer_error("AccessDeniedException", f"The provided IAM Role: {role_arn} does not have the "
+                                "proper IAM permissions to call Glue APIs. Please update the role's IAM "
+                                "permissions to allow access to the table", 403)
+    location = (table.get("StorageDescriptor") or {}).get("Location", "")
+    bucket = location.split("://", 1)[-1].split("/", 1)[0]
+    if not (allowed("s3:ListBucket", f"arn:aws:s3:::{bucket}")
+            or any(allowed(f"s3:{a}", f"arn:aws:s3:::{bucket}/*") for a in ("GetObject", "PutObject", "DeleteObject"))):
+        return _optimizer_error("AccessDeniedException", "Access denied", 403)
+    return None
+
+
+def _sort_order_missing(table):
+    metadata = _iceberg_fetch_metadata((table.get("Parameters") or {}).get("metadata_location")) or {}
+    default_id = metadata.get("default-sort-order-id", 0)
+    order = next((o for o in metadata.get("sort-orders", []) if o.get("order-id") == default_id), {})
+    return not order.get("fields")
+
+
+def _create_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type, name = data.get("Type"), data.get("TableName")
+    config = data.get("TableOptimizerConfiguration") or {}
+    # Order as captured on AWS: the table's location, the run rate, an existing optimizer, the role, the sort order.
+    if not (table.get("StorageDescriptor") or {}).get("Location"):
+        return _optimizer_error("InvalidInputException", "Glue table storage warehouse location is null", 400)
+    if not (table.get("Parameters") or {}).get("metadata_location"):
+        return _optimizer_error("InvalidInputException", "Glue table metadata filepath is null", 400)
+    rate_error = _run_rate_error(config)
+    if rate_error:
+        return rate_error
+    if optimizer_type in optimizers:
+        return _optimizer_error("AlreadyExistsException",
+                                f"An optimizer of type {optimizer_type} already exists on table with name: {name}", 400)
+    role_error = _role_refusal(table, config.get("roleArn") or "")
+    if role_error:
+        return role_error
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: _optimizer_config(
+        optimizer_type, data.get("TableOptimizerConfiguration"))}
+    return json_response({})
+
+
+def _get_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    _key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+
+
+def _update_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _no_optimizer(optimizer_type, data.get("TableName"))
+    config = _optimizer_config(optimizer_type, data.get("TableOptimizerConfiguration"))
+    strategy = ((config.get("compactionConfiguration") or {}).get("icebergConfiguration") or {}).get("strategy")
+    if optimizer_type == "compaction" and strategy == "sort" and _sort_order_missing(table):
+        return _optimizer_error("InvalidInputException", "Sort order is not present in metadata", 400)
+    _table_optimizers[key] = {**optimizers, optimizer_type: config}  # replaces it: fields left out are dropped
+    return json_response({})
+
+
+def _delete_table_optimizer(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    key, _table, optimizers = found
+    optimizer_type = data.get("Type")
+    if optimizer_type not in optimizers:
+        return _optimizer_error("EntityNotFoundException",
+                                f"An optimizer of type {optimizer_type} does not exist on table {data.get('TableName')}",
+                                404)
+    _table_optimizers[key] = {t: c for t, c in optimizers.items() if t != optimizer_type}
+    return json_response({})
+
+
+def _batch_get_table_optimizer(data):
+    found, failures = [], []
+    for entry in data.get("Entries") or []:
+        catalog_id = entry.get("catalogId") or get_account_id()
+        db_name, name, optimizer_type = entry.get("databaseName"), entry.get("tableName"), entry.get("type")
+        table = _tables.get(f"{db_name}/{name}")
+        optimizers = _table_optimizers.get(f"{db_name}/{name}") or {}
+        ids = {"catalogId": catalog_id, "databaseName": db_name, "tableName": name}
+        if table is None:
+            error = ("EntityNotFoundException", _entity_not_found_message())
+        elif not (table.get("Parameters") or {}).get("metadata_location"):
+            error = ("InvalidInputException", "Request Validation Failed: Unsupported Table type")
+        elif optimizer_type not in optimizers:
+            error = ("EntityNotFoundException", f"No optimizer of type {optimizer_type} found for the table: {name}")
+        else:
+            found.append({**ids, "tableOptimizer": _optimizer_response(optimizer_type, optimizers[optimizer_type])})
+            continue
+        failures.append({"error": {"ErrorCode": error[0], "ErrorMessage": error[1]}, **ids, "type": optimizer_type})
+    return json_response({"TableOptimizers": found, "Failures": failures})
+
+
+def _list_table_optimizer_runs(data):
+    found, err = _optimizer_table(data)
+    if err:
+        return err
+    if data.get("Type") not in found[2]:
+        return _no_optimizer(data.get("Type"), data.get("TableName"))
+    return json_response({"CatalogId": data.get("CatalogId") or get_account_id(),
+                          "DatabaseName": data.get("DatabaseName"), "TableName": data.get("TableName"),
+                          "TableOptimizerRuns": []})
 
 
 # ---- Partitions ----
@@ -1094,7 +1339,7 @@ def _create_partition(data):
             "DatabaseName": db_name,
             "TableName": table_name,
             "CreationTime": int(time.time()),
-            "LastAccessTime": int(time.time()),
+            "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
             "CatalogId": get_account_id(),
         }
     )
@@ -1106,8 +1351,12 @@ def _delete_partition(data):
     table_name = data.get("TableName")
     values = data.get("PartitionValues", [])
     key = f"{db_name}/{table_name}"
-    if key in _partitions:
-        _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+    if not any(p.get("Values") == values for p in _partitions.get(key, [])):
+        return error_response_json("EntityNotFoundException", "Partition not found", 400)
+    _partitions[key] = [p for p in _partitions[key] if p.get("Values") != values]
     if key in _partition_column_statistics:
         _partition_column_statistics[key] = [e for e in _partition_column_statistics[key] if e.get("Values") != values]
     return json_response({})
@@ -1124,11 +1373,311 @@ def _get_partition(data):
     return error_response_json("EntityNotFoundException", "Partition not found", 400)
 
 
+class _PartitionFilterError(Exception):
+    def __init__(self, message="Invalid partition expression!"):
+        super().__init__(message)
+
+
+# Any partition key outside these types makes Glue reject every Expression on the table.
+_FILTERABLE_KEY_TYPES = {"string", "char", "varchar", "date", "timestamp", "tinyint", "smallint", "int", "bigint",
+                         "long", "decimal"}
+_INTEGER_KEY_TYPES = {"tinyint", "smallint", "int", "bigint", "long"}
+_STRING_KEY_TYPES = {"string", "char", "varchar"}
+_DEFAULT_PARTITION_PAGE_SIZE = 500
+_FILTER_TOKEN = re.compile(
+    r"\s*(?:(?P<str>'(?:[^']|'')*')|(?P<num>\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)"
+    r"|(?P<op><>|!=|<=|>=|\|\||[=<>(),+\-*/])|(?P<word>[A-Za-z_][A-Za-z0-9_]*|`[^`]+`)|(?P<other>\S))"
+)
+_FILTER_OPS = {
+    "=": lambda a, b: a == b,
+    "<>": lambda a, b: a != b,
+    "!=": lambda a, b: a != b,
+    "<": lambda a, b: a < b,
+    "<=": lambda a, b: a <= b,
+    ">": lambda a, b: a > b,
+    ">=": lambda a, b: a >= b,
+}
+
+
+def _parse_big_integer(raw):
+    """Parse like java.math.BigInteger(String); Glue puts its error text into the response."""
+    def fail(reason):
+        raise _PartitionFilterError(
+            f"com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: {reason} is not an integer.")
+
+    if not raw:
+        fail("Zero length BigInteger")
+    minus, plus = raw.rfind("-"), raw.rfind("+")
+    if (minus >= 0 and (minus != 0 or plus >= 0)) or plus > 0:
+        fail("Illegal embedded sign character")
+    body = raw[1:] if raw[0] in "+-" else raw
+    if not body:
+        fail("Zero length BigInteger")
+    digits = body.lstrip("0")
+    first = len(digits) % 9 or 9
+    for group in [digits[:first]] + [digits[i:i + 9] for i in range(first, len(digits), 9)] if digits else []:
+        if not (group.isascii() and group.isdigit()):
+            fail(f'For input string: "{group}"')
+    return int(raw)
+
+
+def _parse_partition_value(raw, col_type):
+    """Turn a partition value or literal into a comparable value for its key type, as Glue does."""
+    prefix = "com.amazonaws.daylight.core.exceptions.InvalidPartitionValueException: "
+    if col_type in _INTEGER_KEY_TYPES:
+        return _parse_big_integer(raw)
+    if col_type == "decimal":
+        if not re.fullmatch(r"[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?", raw):
+            raise _PartitionFilterError(f"{prefix}{raw} is not a decimal.")
+        return Decimal(raw)
+    if col_type == "date":
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+        if not m or not 1 <= int(m[2]) <= 12 or not 1 <= int(m[3]) <= 31:
+            raise _PartitionFilterError(f"{prefix}{raw} is not a date.")
+        # java.sql.Date is lenient: 2024-02-31 rolls over into March.
+        return datetime.date(int(m[1]), int(m[2]), 1) + datetime.timedelta(days=int(m[3]) - 1)
+    if col_type == "timestamp":
+        m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2}) (\d{1,2}):(\d{1,2}):(\d{1,2})(?:\.(\d{1,9}))?", raw)
+        if not m or not 1 <= int(m[2]) <= 12 or not 1 <= int(m[3]) <= 31:
+            raise _PartitionFilterError(
+                f"{prefix}Timestamp format must be yyyy-mm-dd hh:mm:ss[.fffffffff] {raw} is not a timestamp.")
+        start = datetime.datetime(int(m[1]), int(m[2]), 1)
+        offset = datetime.timedelta(days=int(m[3]) - 1, hours=int(m[4]), minutes=int(m[5]), seconds=int(m[6]))
+        return start + offset, int((m[7] or "").ljust(9, "0"))
+    return raw
+
+
+def _tokenize_partition_filter(expr):
+    tokens, pos, expr = [], 0, expr.rstrip()
+    while pos < len(expr):
+        m = _FILTER_TOKEN.match(expr, pos)
+        pos = m.end()
+        kind = m.lastgroup
+        text = m.group(kind)
+        if kind == "str":
+            text = text[1:-1].replace("''", "'")
+        tokens.append((kind, text))
+    # Glue accepts redundant parentheses around a single column or literal: ((k)) = (('1')).
+    i = 0
+    while i + 2 < len(tokens):
+        in_list = i > 0 and tokens[i - 1][0] == "word" and tokens[i - 1][1].upper() == "IN"
+        if (tokens[i] == ("op", "(") and tokens[i + 2] == ("op", ")") and tokens[i + 1][0] in ("word", "str", "num")
+                and not in_list):
+            del tokens[i + 2], tokens[i]
+            i = max(i - 1, 0)
+        else:
+            i += 1
+    return tokens
+
+
+def _compile_partition_filter(expr, partition_keys):
+    """Compile a Glue GetPartitions Expression into a predicate over a partition's Values list."""
+    columns = {}
+    for i, k in enumerate(partition_keys):
+        col_type = (k.get("Type") or "string").lower().split("(")[0].strip()
+        if col_type not in _FILTERABLE_KEY_TYPES:
+            raise _PartitionFilterError()
+        columns[k["Name"].lower()] = (i, col_type)
+    tokens = _tokenize_partition_filter(expr)
+    pos = 0
+
+    def peek(offset=0):
+        return tokens[pos + offset] if pos + offset < len(tokens) else (None, None)
+
+    def take(kind=None, value=None):
+        nonlocal pos
+        k, v = peek()
+        if k is None or (kind and k != kind) or (value and (v.upper() if k == "word" else v) != value):
+            raise _PartitionFilterError()
+        pos += 1
+        return v
+
+    def is_kw(word):
+        k, v = peek()
+        return k == "word" and v.upper() == word
+
+    def disjunction():
+        left = conjunction()
+        while is_kw("OR"):
+            take()
+            left = (lambda l, r: lambda row: l(row) or r(row))(left, conjunction())
+        return left
+
+    def conjunction():
+        left = negation()
+        while is_kw("AND"):
+            take()
+            left = (lambda l, r: lambda row: l(row) and r(row))(left, negation())
+        return left
+
+    def negation():
+        if is_kw("NOT"):
+            take()
+            if is_kw("NOT"):
+                raise _PartitionFilterError()
+            inner = negation()
+            return lambda row: not inner(row)
+        if peek() == ("op", "("):
+            take()
+            inner = disjunction()
+            take("op", ")")
+            return inner
+        return predicate()
+
+    def predicate():
+        name = take("word").strip("`")
+        if name.lower() not in columns:
+            raise _PartitionFilterError()
+        idx, col_type = columns[name.lower()]
+
+        def literal():
+            sign = ""
+            if peek()[0] == "op" and peek()[1] in "+-" and peek(1)[0] == "num":
+                sign = "-" if take() == "-" else ""
+            kind = peek()[0]
+            if kind not in ("str", "num"):
+                raise _PartitionFilterError()
+            raw = take()
+            # A literal followed by an arithmetic or concatenation operator is no longer a plain value.
+            if peek()[0] == "op" and peek()[1] in ("||", "+", "-", "*", "/"):
+                raise _PartitionFilterError()
+            if kind == "num" and raw.isdigit() and int(raw) > 2**63 - 1:
+                raise _PartitionFilterError()
+            return _parse_partition_value(sign + raw, col_type)
+
+        if is_kw("IS"):
+            take()
+            not_null = is_kw("NOT")
+            if not_null:
+                take()
+            take("word", "NULL")
+            # Partition values are never null in Glue: IS NULL matches nothing, IS NOT NULL everything.
+            return lambda row: not_null
+
+        negate = False
+        if is_kw("NOT"):
+            take()
+            negate = True
+        if is_kw("IN"):
+            take()
+            take("op", "(")
+            values = [literal()]
+            while peek() == ("op", ","):
+                take()
+                values.append(literal())
+            take("op", ")")
+            test = values.__contains__
+        elif is_kw("BETWEEN"):
+            take()
+            low = literal()
+            take("word", "AND")
+            high = literal()
+
+            def test(v):
+                return low <= v <= high
+        elif is_kw("LIKE") and not negate and col_type in _STRING_KEY_TYPES:
+            take()
+            if peek()[0] != "str":
+                raise _PartitionFilterError()
+            pattern = "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in take())
+            if peek()[0] == "op" and peek()[1] == "||":
+                raise _PartitionFilterError()
+            regex = re.compile(pattern, re.DOTALL | re.IGNORECASE)
+            return lambda row: idx < len(row) and bool(regex.fullmatch(row[idx]))
+        elif not negate and peek()[0] == "op" and peek()[1] in _FILTER_OPS:
+            op = _FILTER_OPS[take()]
+            value = literal()
+
+            def test(v):
+                return op(v, value)
+        else:
+            raise _PartitionFilterError()
+
+        def evaluate(row):
+            try:
+                value = _parse_partition_value(row[idx], col_type)
+            except (_PartitionFilterError, IndexError):
+                return False
+            return negate != test(value)
+
+        return evaluate
+
+    # Glue ignores whatever follows a complete expression.
+    return disjunction()
+
+
+def _partition_table_error(db_name, table_name):
+    if db_name not in _databases:
+        return error_response_json("EntityNotFoundException", f"Database {db_name} not found.", 400)
+    if f"{db_name}/{table_name}" not in _tables:
+        return error_response_json("EntityNotFoundException", f"Table {table_name} not found.", 400)
+    return None
+
+
+def _partition_token(key, offset):
+    return base64.b64encode(json.dumps({"table": key, "offset": offset}).encode()).decode()
+
+
+def _partition_token_offset(token, key):
+    if not token:
+        return 0
+    try:
+        decoded = json.loads(base64.b64decode(token, validate=True))
+        table, offset = decoded["table"], int(decoded["offset"])
+    except (ValueError, KeyError, TypeError):
+        raise _PartitionFilterError("Invalid token value")
+    if table != key:
+        raise _PartitionFilterError("NextToken key is not valid")
+    return offset
+
+
 def _get_partitions(data):
     db_name = data.get("DatabaseName")
     table_name = data.get("TableName")
     key = f"{db_name}/{table_name}"
-    return json_response({"Partitions": _partitions.get(key, [])})
+    max_results = data.get("MaxResults")
+    if max_results and max_results > 1000:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{max_results}' at 'maxResults' failed to satisfy constraint: "
+            "Member must have value less than or equal to 1000",
+            400,
+        )
+    segment = data.get("Segment") or {}
+    number, total = segment.get("SegmentNumber", 0), segment.get("TotalSegments", 1)
+    if total > 10:
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '{total}' at 'segment.totalSegments' failed to satisfy constraint: "
+            "Member must have value less than or equal to 10",
+            400,
+        )
+    if number >= total:
+        return error_response_json("InvalidInputException", "Segment number should be less than total segments.", 400)
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+
+    expression = data.get("Expression")
+    try:
+        matches = _compile_partition_filter(expression, _tables[key].get("PartitionKeys") or []) if expression else None
+        start = _partition_token_offset(data.get("NextToken"), key)
+    except _PartitionFilterError as e:
+        return error_response_json("InvalidInputException", str(e), 400)
+
+    parts = _partitions.get(key, [])
+    parts = parts[number * len(parts) // total:(number + 1) * len(parts) // total]
+    # MaxResults bounds the partitions scanned, not the matches: filtered pages can be short or empty.
+    # ponytail: offset token; partitions deleted between pages shift later pages.
+    window = parts[start:start + (max_results or _DEFAULT_PARTITION_PAGE_SIZE)]
+    page = [p for p in window if matches is None or matches(p.get("Values") or [])]
+    if data.get("ExcludeColumnSchema"):
+        page = [{**p, "StorageDescriptor": {**p["StorageDescriptor"], "Columns": []}} if "StorageDescriptor" in p else p
+                for p in page]
+    resp = {"Partitions": page}
+    if window:
+        resp["NextToken"] = _partition_token(key, start + len(window))
+    return json_response(resp)
 
 
 def _batch_create_partition(data):
@@ -1158,6 +1707,42 @@ def _batch_create_partition(data):
                     "CatalogId": get_account_id(),
                 }
             )
+    return json_response({"Errors": errors})
+
+
+def _batch_delete_partition(data):
+    db_name = data.get("DatabaseName")
+    table_name = data.get("TableName")
+    key = f"{db_name}/{table_name}"
+    to_delete = data.get("PartitionsToDelete") or []
+    if len(to_delete) > 25:
+        listed = ", ".join(f"PartitionValueList(values=[{', '.join(e.get('Values') or [])}])" for e in to_delete)
+        return error_response_json(
+            "ValidationException",
+            f"1 validation error detected: Value '[{listed}]' at 'partitionsToDelete' failed to satisfy constraint: "
+            "Member must have length less than or equal to 25",
+            400,
+        )
+    err = _partition_table_error(db_name, table_name)
+    if err:
+        return err
+    existing = {tuple(p.get("Values") or []) for p in _partitions.get(key, [])}
+    errors, deleted = [], set()
+    for entry in to_delete:
+        values = tuple(entry.get("Values") or [])
+        if values in existing and values not in deleted:
+            deleted.add(values)
+        else:
+            errors.append({
+                "PartitionValues": list(values),
+                "ErrorDetail": {"ErrorCode": "EntityNotFoundException", "ErrorMessage": "Partition not found"},
+            })
+    if deleted:
+        _partitions[key] = [p for p in _partitions[key] if tuple(p.get("Values") or []) not in deleted]
+        if key in _partition_column_statistics:
+            _partition_column_statistics[key] = [
+                e for e in _partition_column_statistics[key] if tuple(e.get("Values") or []) not in deleted
+            ]
     return json_response({"Errors": errors})
 
 
@@ -1215,7 +1800,7 @@ def _batch_update_partition(data):
                 "DatabaseName": db_name,
                 "TableName": table_name,
                 "CreationTime": creation_time,
-                "LastAccessTime": int(time.time()),
+                "LastAccessTime": partition_input.get("LastAccessTime", int(time.time())),
                 "CatalogId": get_account_id(),
             }
         )
@@ -1459,6 +2044,8 @@ def _create_crawler(data):
         "Configuration": data.get("Configuration", ""),
         "CrawlerSecurityConfiguration": data.get("CrawlerSecurityConfiguration", ""),
     }
+    if data.get("LakeFormationConfiguration") is not None:
+        _crawlers[name]["LakeFormationConfiguration"] = data["LakeFormationConfiguration"]
     return json_response({})
 
 
@@ -1498,6 +2085,7 @@ def _update_crawler(data):
         "SchemaChangePolicy",
         "RecrawlPolicy",
         "LineageConfiguration",
+        "LakeFormationConfiguration",
         "Configuration",
         "CrawlerSecurityConfiguration",
     }
@@ -1587,6 +2175,21 @@ def _get_crawler_metrics(data):
 # ---- Jobs ----
 
 
+_JOB_OPTIONAL_FIELDS = (
+    "JobRunQueuingEnabled", "LogUri", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+    "NotificationProperty", "CodeGenConfigurationNodes", "ExecutionClass", "SourceControlDetails",
+    "MaintenanceWindow",
+)
+
+
+def _default_job_timeout(glue_version):
+    """2,880 minutes for Glue 4.0 and earlier, 480 for 5.0 and later (botocore CreateJob Timeout)."""
+    try:
+        return 480 if float(glue_version) >= 5.0 else 2880
+    except (TypeError, ValueError):
+        return 2880
+
+
 def _create_job(data):
     name = data.get("Name")
     if not name:
@@ -1602,16 +2205,21 @@ def _create_job(data):
         "NonOverridableArguments": data.get("NonOverridableArguments", {}),
         "Connections": data.get("Connections", {}),
         "MaxRetries": data.get("MaxRetries", 0),
-        "Timeout": data.get("Timeout", 2880),
-        "GlueVersion": data.get("GlueVersion", "3.0"),
-        "NumberOfWorkers": data.get("NumberOfWorkers", 2),
-        "WorkerType": data.get("WorkerType", "G.1X"),
-        "MaxCapacity": data.get("MaxCapacity"),
+        "GlueVersion": data.get("GlueVersion", "5.1"),
+        "JobMode": data.get("JobMode", "SCRIPT"),
+        "ExecutionProperty": data.get("ExecutionProperty") or {"MaxConcurrentRuns": 1},
         "SecurityConfiguration": data.get("SecurityConfiguration", ""),
         "Tags": data.get("Tags", {}),
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    _jobs[name]["Timeout"] = data.get("Timeout", _default_job_timeout(_jobs[name]["GlueVersion"]))
+    for k in _JOB_OPTIONAL_FIELDS:
+        if data.get(k) is not None:
+            _jobs[name][k] = data[k]
+    if ("MaxCapacity" not in _jobs[name] and "WorkerType" not in _jobs[name]
+            and _jobs[name]["Command"].get("Name") == "pythonshell"):
+        _jobs[name]["MaxCapacity"] = 0.0625
     _job_runs[name] = []
     return json_response({"Name": name})
 
@@ -1628,11 +2236,11 @@ def _get_job(data):
     job = _jobs.get(name)
     if not job:
         return error_response_json("EntityNotFoundException", f"Job {name} not found", 400)
-    return json_response({"Job": job})
+    return json_response(to_output_shape("glue", "GetJobResponse", {"Job": job}))
 
 
 def _get_jobs(data):
-    return json_response({"Jobs": list(_jobs.values())})
+    return json_response(to_output_shape("glue", "GetJobsResponse", {"Jobs": list(_jobs.values())}))
 
 
 def _update_job(data):
@@ -1654,6 +2262,16 @@ def _update_job(data):
         "WorkerType",
         "MaxCapacity",
         "SecurityConfiguration",
+        "JobMode",
+        "JobRunQueuingEnabled",
+        "LogUri",
+        "ExecutionProperty",
+        "AllocatedCapacity",
+        "NotificationProperty",
+        "CodeGenConfigurationNodes",
+        "ExecutionClass",
+        "SourceControlDetails",
+        "MaintenanceWindow",
     }
     for k in updatable:
         if k in job_update:
@@ -1734,16 +2352,19 @@ def _start_job_run(data):
         "Arguments": args,
         "ErrorMessage": "",
         "PredecessorRuns": [],
-        "AllocatedCapacity": job.get("MaxCapacity") or job.get("NumberOfWorkers", 2),
         "ExecutionTime": 0,
-        "Timeout": job.get("Timeout", 2880),
-        "MaxCapacity": job.get("MaxCapacity"),
-        "WorkerType": job.get("WorkerType", "G.1X"),
-        "NumberOfWorkers": job.get("NumberOfWorkers", 2),
-        "SecurityConfiguration": job.get("SecurityConfiguration", ""),
-        "GlueVersion": job.get("GlueVersion", "3.0"),
+        "Timeout": data.get("Timeout") or job.get("Timeout", 2880),
+        "SecurityConfiguration": data.get("SecurityConfiguration") or job.get("SecurityConfiguration", ""),
+        "GlueVersion": job.get("GlueVersion", "5.1"),
         "Attempt": 0,
     }
+    if job.get("JobMode"):
+        run["JobMode"] = job["JobMode"]
+    for k in ("JobRunQueuingEnabled", "AllocatedCapacity", "MaxCapacity", "WorkerType", "NumberOfWorkers",
+              "NotificationProperty", "ExecutionClass", "MaintenanceWindow", "ExecutionRoleSessionPolicy"):
+        value = data.get(k) if data.get(k) is not None else job.get(k)
+        if value is not None:
+            run[k] = value
 
     if job_name not in _job_runs:
         _job_runs[job_name] = []
@@ -1768,12 +2389,13 @@ def _start_job_run(data):
             except Exception:
                 logger.info("Glue: image %s not available — stubbing job %s", image, job_name)
 
+        run_job = {**job, "Timeout": run["Timeout"]}
         if use_docker:
-            _execute_spark_docker(run, job, job_name, script_args, resolved, docker_client)
+            _execute_spark_docker(run, run_job, job_name, script_args, resolved, docker_client)
         elif _is_spark_job(job):
             run["JobRunState"] = "SUCCEEDED"
         elif resolved and resolved.endswith(".py"):
-            _execute_subprocess(run, job, script_args, resolved)
+            _execute_subprocess(run, run_job, script_args, resolved)
         else:
             run["JobRunState"] = "SUCCEEDED"
 
@@ -2190,6 +2812,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
 
     try:
         container = docker_client.containers.create(**container_kwargs)
+        _live_job_containers.add(getattr(container, "id", None))
         # Copy script into container (avoids Docker-in-Docker volume mount issues)
         import io
         import tarfile
@@ -2211,6 +2834,7 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Docker container start failed: {e}"[:2000]
         try:
             container.remove(force=True, v=True)
+            _live_job_containers.discard(getattr(container, "id", None))
         except Exception:
             pass
         return
@@ -2239,10 +2863,16 @@ def _execute_spark_docker(run, job, job_name, args, script_path, docker_client):
         run["ErrorMessage"] = f"Container execution error: {e}"[:4000]
         logger.warning("Glue: Spark container for %s error: %s", job_name, e)
     finally:
+        _live_job_containers.discard(getattr(container, "id", None))
         try:
             container.remove(force=True, v=True)
         except Exception:
             pass
+
+
+# Job runs still in progress; any other stopped glue container is the reaper's.
+_live_job_containers: set = set()
+container_reaper.register_live_ids("glue", lambda: set(_live_job_containers) - {None})
 
 
 def _get_job_run(data):
@@ -2410,6 +3040,8 @@ def _create_trigger(data):
         "CreatedOn": int(time.time()),
         "LastModifiedOn": int(time.time()),
     }
+    if data.get("EventBatchingCondition") is not None:
+        _triggers[name]["EventBatchingCondition"] = data["EventBatchingCondition"]
     if data.get("StartOnCreation", False):
         _triggers[name]["State"] = "ACTIVATED"
     if data.get("Tags"):
@@ -2423,7 +3055,7 @@ def _get_trigger(data):
     trigger = _triggers.get(name)
     if not trigger:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
-    return json_response({"Trigger": trigger})
+    return json_response(to_output_shape("glue", "GetTriggerResponse", {"Trigger": trigger}))
 
 
 def _delete_trigger(data):
@@ -2440,12 +3072,12 @@ def _update_trigger(data):
     if name not in _triggers:
         return error_response_json("EntityNotFoundException", f"Trigger {name} not found", 400)
     trigger_update = data.get("TriggerUpdate", {})
-    updatable = {"Schedule", "Predicate", "Actions", "Description"}
+    updatable = {"Schedule", "Predicate", "Actions", "Description", "EventBatchingCondition"}
     for k in updatable:
         if k in trigger_update:
             _triggers[name][k] = trigger_update[k]
     _triggers[name]["LastModifiedOn"] = int(time.time())
-    return json_response({"Trigger": _triggers[name]})
+    return json_response(to_output_shape("glue", "UpdateTriggerResponse", {"Trigger": _triggers[name]}))
 
 
 def _start_trigger(data):
@@ -2482,7 +3114,8 @@ def _batch_get_triggers(data):
     requested = data.get("TriggerNames", [])
     found = [_triggers[n] for n in requested if n in _triggers]
     not_found = [n for n in requested if n not in _triggers]
-    return json_response({"Triggers": found, "TriggersNotFound": not_found})
+    return json_response(to_output_shape("glue", "BatchGetTriggersResponse",
+                                         {"Triggers": found, "TriggersNotFound": not_found}))
 
 
 def _get_triggers(data):
@@ -2494,7 +3127,7 @@ def _get_triggers(data):
             if not any(a.get("JobName") == dependent_job for a in actions):
                 continue
         triggers.append(trigger)
-    return json_response({"Triggers": triggers})
+    return json_response(to_output_shape("glue", "GetTriggersResponse", {"Triggers": triggers}))
 
 
 # ---- Workflows ----
@@ -2572,7 +3205,7 @@ def _start_workflow_run(data):
             "FailedActions": 0,
             "TimeoutActions": 0,
         },
-        "WorkflowRunProperties": dict(_workflows[name].get("DefaultRunProperties", {})),
+        "WorkflowRunProperties": {**_workflows[name].get("DefaultRunProperties", {}), **(data.get("RunProperties") or {})},
     }
     _workflow_runs.setdefault(name, []).append(run)
     return json_response({"RunId": run_id})
@@ -2588,13 +3221,14 @@ def _udf_key(db_name: str, func_name: str) -> str:
 def _udf_record(db_name: str, fn_input: dict) -> dict:
     """Build a UserDefinedFunction record matching the botocore output shape:
     UserDefinedFunction { FunctionName, DatabaseName, ClassName, OwnerName,
-    OwnerType, CreateTime, ResourceUris, CatalogId }."""
+    FunctionType, OwnerType, CreateTime, ResourceUris, CatalogId }."""
     return {
         "FunctionName": fn_input.get("FunctionName"),
         "DatabaseName": db_name,
         "ClassName": fn_input.get("ClassName"),
         "OwnerName": fn_input.get("OwnerName"),
         "OwnerType": fn_input.get("OwnerType"),
+        **({"FunctionType": fn_input["FunctionType"]} if fn_input.get("FunctionType") else {}),
         "CreateTime": int(time.time()),
         "ResourceUris": fn_input.get("ResourceUris", []),
         "CatalogId": get_account_id(),
@@ -2628,7 +3262,7 @@ def _update_user_defined_function(data):
         )
     fn_input = data.get("FunctionInput") or {}
     existing = _user_defined_functions[key]
-    for field in ("ClassName", "OwnerName", "OwnerType", "ResourceUris"):
+    for field in ("ClassName", "OwnerName", "OwnerType", "FunctionType", "ResourceUris"):
         if field in fn_input:
             existing[field] = fn_input[field]
     # AWS allows renaming the function via FunctionInput.FunctionName.
@@ -2778,6 +3412,7 @@ def reset():
     _user_defined_functions.clear()
     _table_column_statistics.clear()
     _partition_column_statistics.clear()
+    _table_optimizers.clear()
 
 
 async def handle_request(method, path, headers, body, query_params):
